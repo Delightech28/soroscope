@@ -9,8 +9,10 @@ pub mod insights;
 mod jobs;
 mod parser;
 pub mod rpc_provider;
+mod cache;
 mod simulation;
 
+use crate::cache::{SimulationCache, ContractCache};
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
 use crate::errors::AppError;
 use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
@@ -21,7 +23,7 @@ use crate::jobs::{
     JobId, JobQueue, JobQueueConfig, JobWorker, SubmitJobRequest, SubmitJobResponse,
 };
 use crate::rpc_provider::{ProviderRegistry, RpcProvider};
-use crate::simulation::{SimulationCache, SimulationEngine, SimulationResult};
+use crate::simulation::{SimulationEngine, SimulationResult};
 use axum::{
     extract::{Json, Multipart, Path, State},
     http::{HeaderMap, HeaderName, HeaderValue},
@@ -1151,12 +1153,17 @@ async fn main() {
         tracing::info!("Fee market analysis is disabled");
     }
 
+    // ── Persistent Cache Setup (L2) ─────────────────────────────────────
+    let sled_db = sled::open("soroscope_cache").expect("Failed to open sled database");
+    let simulation_cache = SimulationCache::new(&sled_db);
+    let contract_cache = Arc::new(ContractCache::new(&sled_db));
+
     let app_state = Arc::new(AppState {
-        engine: SimulationEngine::with_registry_and_timeout(
+        engine: SimulationEngine::with_registry_and_cache(
             Arc::clone(&registry),
-            simulation_timeout,
+            Arc::clone(&contract_cache),
         ),
-        cache: SimulationCache::new(),
+        cache: simulation_cache,
         insights_engine: InsightsEngine::new(),
         simulation_timeout,
         fee_analytics_engine,

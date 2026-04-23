@@ -1,7 +1,7 @@
 use crate::parser::ArgParser;
 use crate::rpc_provider::ProviderRegistry;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use moka::future::Cache;
+// use moka::future::Cache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,7 +16,7 @@ use soroban_sdk::xdr::{
 };
 use ed25519_dalek::Signer as Ed25519Signer;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+// use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stellar_strkey::Strkey;
@@ -265,6 +265,7 @@ pub struct SimulationEngine {
     request_timeout: std::time::Duration,
     /// When set, the engine will iterate healthy providers and failover automatically.
     registry: Option<Arc<ProviderRegistry>>,
+    contract_cache: Option<Arc<crate::cache::ContractCache>>,
 }
 
 impl SimulationEngine {
@@ -279,6 +280,7 @@ impl SimulationEngine {
             client: Client::new(),
             request_timeout: std::time::Duration::from_secs(30),
             registry: None,
+            contract_cache: None,
         }
     }
 
@@ -289,6 +291,21 @@ impl SimulationEngine {
             client: Client::new(),
             request_timeout: std::time::Duration::from_secs(30),
             registry: Some(registry),
+            contract_cache: None,
+        }
+    }
+
+    /// Create an engine with a registry and a contract cache.
+    pub fn with_registry_and_cache(
+        registry: Arc<ProviderRegistry>,
+        cache: Arc<crate::cache::ContractCache>,
+    ) -> Self {
+        Self {
+            rpc_url: String::new(),
+            client: Client::new(),
+            request_timeout: std::time::Duration::from_secs(30),
+            registry: Some(registry),
+            contract_cache: Some(cache),
         }
     }
 
@@ -302,6 +319,7 @@ impl SimulationEngine {
             client: Client::new(),
             request_timeout: timeout,
             registry: Some(registry),
+            contract_cache: None,
         }
     }
 
@@ -313,6 +331,112 @@ impl SimulationEngine {
     /// Get the current request timeout.
     pub fn timeout(&self) -> std::time::Duration {
         self.request_timeout
+    }
+
+    /// Get the WASM bytes for a contract, checking the cache first.
+    pub async fn get_contract_wasm(&self, contract_id: &str) -> Result<Vec<u8>, SimulationError> {
+        let contract_hash_bytes = self.parse_contract_id(contract_id)?;
+        let hash_hex = hex::encode(contract_hash_bytes);
+
+        if let Some(cache) = &self.contract_cache {
+            if let Some(wasm) = cache.get_wasm(&hash_hex) {
+                tracing::debug!(contract_id = %contract_id, "WASM cache HIT");
+                return Ok(wasm);
+            }
+        }
+
+        tracing::info!(contract_id = %contract_id, "WASM cache MISS, fetching from RPC");
+        
+        // 1. Fetch contract instance to get the WASM hash
+        let instance_key = LedgerKey::ContractData(soroban_sdk::xdr::ContractDataLedgerKey {
+            contract: ScAddress::Contract(Hash(contract_hash_bytes)),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: soroban_sdk::xdr::ContractDataDurability::Persistent,
+        });
+
+        let key_xdr = BASE64.encode(instance_key.to_xdr(Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?);
+        
+        // We need a provider URL to fetch from.
+        let (url, auth_h, auth_v) = match &self.registry {
+            Some(reg) => {
+                let p = reg.healthy_providers().await.into_iter().next().ok_or_else(|| SimulationError::RpcRequestFailed("No healthy providers".to_string()))?;
+                (p.url.clone(), p.auth_header.clone(), p.auth_value.clone())
+            }
+            None => (self.rpc_url.clone(), None, None),
+        };
+
+        let req = GetLedgerEntriesRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+            method: "getLedgerEntries".to_string(),
+            params: GetLedgerEntriesParams {
+                keys: vec![key_xdr],
+            },
+        };
+
+        let response: GetLedgerEntriesResponse = self.client.post(&url).json(&req).send().await?.json().await.map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
+        let entries = match response.result {
+            LedgerEntriesResponseResult::Success { result } => result.entries,
+            LedgerEntriesResponseResult::Error { error } => return Err(SimulationError::NodeError(error.message)),
+        };
+
+        let entry_meta = entries.first().ok_or_else(|| SimulationError::InvalidContract("Contract instance not found".to_string()))?;
+        let entry_xdr = entry_meta.xdr.as_ref().ok_or_else(|| SimulationError::InvalidContract("No XDR in ledger entry".to_string()))?;
+        let entry_bytes = BASE64.decode(entry_xdr)?;
+        let entry = LedgerEntry::from_xdr(&entry_bytes, Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?;
+
+        let wasm_hash = match entry.data {
+            soroban_sdk::xdr::LedgerEntryData::ContractData(d) => {
+                match d.val {
+                    ScVal::ContractInstance(i) => {
+                        match i.executable {
+                            soroban_sdk::xdr::ContractExecutable::Wasm(h) => h,
+                            _ => return Err(SimulationError::InvalidContract("Contract is not a WASM contract".to_string())),
+                        }
+                    }
+                    _ => return Err(SimulationError::InvalidContract("Invalid contract instance data".to_string())),
+                }
+            }
+            _ => return Err(SimulationError::InvalidContract("Invalid ledger entry data type".to_string())),
+        };
+
+        // 2. Fetch the actual WASM bytes
+        let wasm_key = LedgerKey::ContractCode(soroban_sdk::xdr::ContractCodeLedgerKey {
+            hash: wasm_hash.clone(),
+        });
+        let wasm_key_xdr = BASE64.encode(wasm_key.to_xdr(Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?);
+
+        let req2 = GetLedgerEntriesRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 2,
+            method: "getLedgerEntries".to_string(),
+            params: GetLedgerEntriesParams {
+                keys: vec![wasm_key_xdr],
+            },
+        };
+
+        let response2: GetLedgerEntriesResponse = self.client.post(&url).json(&req2).send().await?.json().await.map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
+        let entries2 = match response2.result {
+            LedgerEntriesResponseResult::Success { result } => result.entries,
+            LedgerEntriesResponseResult::Error { error } => return Err(SimulationError::NodeError(error.message)),
+        };
+
+        let entry_meta2 = entries2.first().ok_or_else(|| SimulationError::InvalidContract("Contract code not found".to_string()))?;
+        let entry_xdr2 = entry_meta2.xdr.as_ref().ok_or_else(|| SimulationError::InvalidContract("No XDR in code ledger entry".to_string()))?;
+        let entry_bytes2 = BASE64.decode(entry_xdr2)?;
+        let entry2 = LedgerEntry::from_xdr(&entry_bytes2, Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?;
+
+        let wasm_bytes = match entry2.data {
+            soroban_sdk::xdr::LedgerEntryData::ContractCode(c) => c.code.to_vec(),
+            _ => return Err(SimulationError::InvalidContract("Invalid code ledger entry data type".to_string())),
+        };
+
+        // 3. Cache and return
+        if let Some(cache) = &self.contract_cache {
+            cache.set_wasm(hash_hex, wasm_bytes.clone());
+        }
+
+        Ok(wasm_bytes)
     }
 
     /// Simulate transaction from a deployed contract ID
@@ -808,12 +932,44 @@ impl SimulationEngine {
         touched_keys: &[String],
         latest_ledger: u64,
     ) -> Result<TtlAnalysisReport, SimulationError> {
+        let mut missing_keys = Vec::new();
+        let mut cached_reports = Vec::new();
+
+        if let Some(cache) = &self.contract_cache {
+            for key in touched_keys {
+                if let Some(entry_bytes) = cache.get_ledger_entry(key, latest_ledger) {
+                    if let Ok(entry_meta) = serde_json::from_slice::<LedgerEntryWithMeta>(&entry_bytes) {
+                        if let Some(live_until) = entry_meta.live_until_ledger_seq {
+                            cached_reports.push(TtlEntryReport {
+                                key: entry_meta.key,
+                                live_until_ledger: live_until,
+                                remaining_ledgers: live_until as i64 - latest_ledger as i64,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                missing_keys.push(key.clone());
+            }
+        } else {
+            missing_keys = touched_keys.to_vec();
+        }
+
+        if missing_keys.is_empty() {
+            let extend_ttl_suggestions = Self::build_extend_ttl_suggestions(&cached_reports, latest_ledger);
+            return Ok(TtlAnalysisReport {
+                current_ledger: latest_ledger,
+                touched_entries: cached_reports,
+                extend_ttl_suggestions,
+            });
+        }
+
         let req = GetLedgerEntriesRequest {
             jsonrpc: "2.0".to_string(),
             id: 1,
             method: "getLedgerEntries".to_string(),
             params: GetLedgerEntriesParams {
-                keys: touched_keys.to_vec(),
+                keys: missing_keys.clone(),
             },
         };
 
@@ -838,7 +994,7 @@ impl SimulationEngine {
             SimulationError::RpcRequestFailed(format!("Failed to parse response: {}", e))
         })?;
 
-        let entries = match rpc_response.result {
+        let fetched_entries = match rpc_response.result {
             LedgerEntriesResponseResult::Success { result } => result.entries,
             LedgerEntriesResponseResult::Error { error } => {
                 return Err(SimulationError::RpcRequestFailed(format!(
@@ -848,25 +1004,29 @@ impl SimulationEngine {
             }
         };
 
-        let touched_entries: Vec<TtlEntryReport> = entries
-            .into_iter()
-            .filter_map(|entry| {
-                let live_until = entry.live_until_ledger_seq?;
-                let remaining = live_until as i64 - latest_ledger as i64;
-                Some(TtlEntryReport {
+        let mut all_reports = cached_reports;
+        for entry in fetched_entries {
+            if let Some(cache) = &self.contract_cache {
+                if let Ok(bytes) = serde_json::to_vec(&entry) {
+                    cache.set_ledger_entry(entry.key.clone(), bytes, latest_ledger);
+                }
+            }
+
+            if let Some(live_until) = entry.live_until_ledger_seq {
+                all_reports.push(TtlEntryReport {
                     key: entry.key,
                     live_until_ledger: live_until,
-                    remaining_ledgers: remaining,
-                })
-            })
-            .collect();
+                    remaining_ledgers: live_until as i64 - latest_ledger as i64,
+                });
+            }
+        }
 
         let extend_ttl_suggestions =
-            Self::build_extend_ttl_suggestions(&touched_entries, latest_ledger);
+            Self::build_extend_ttl_suggestions(&all_reports, latest_ledger);
 
         Ok(TtlAnalysisReport {
             current_ledger: latest_ledger,
-            touched_entries,
+            touched_entries: all_reports,
             extend_ttl_suggestions,
         })
     }
@@ -1509,81 +1669,7 @@ fn local_parse_arg(env: &soroban_sdk::Env, arg: &str) -> soroban_sdk::Val {
 const CACHE_TTL_SECS: u64 = 3_600;
 const CACHE_MAX_CAPACITY: u64 = 1_000;
 
-/// In-memory simulation result cache backed by `moka`.
-///
-/// Cache key: `hex(sha256(contract_id ‖ function_name ‖ args_as_json))`
-/// TTL: 1 hour — balances freshness vs. RPC cost reduction.
-pub struct SimulationCache {
-    inner: Cache<String, SimulationResult>,
-    hits: AtomicU64,
-    misses: AtomicU64,
-}
-
-impl SimulationCache {
-    pub fn new() -> Arc<Self> {
-        let inner = Cache::builder()
-            .max_capacity(CACHE_MAX_CAPACITY)
-            .time_to_live(Duration::from_secs(CACHE_TTL_SECS))
-            .build();
-        Arc::new(Self {
-            inner,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-        })
-    }
-
-    pub fn generate_key(contract_id: &str, function_name: &str, args: &[String]) -> String {
-        let args_json = serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string());
-        let input = format!("{}{}{}", contract_id, function_name, args_json);
-        let digest = Sha256::digest(input.as_bytes());
-        hex::encode(digest)
-    }
-
-    pub async fn get(&self, key: &str) -> Option<SimulationResult> {
-        let value: Option<SimulationResult> = self.inner.get(key).await;
-        if value.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(cache.key = %key, "Cache HIT");
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(cache.key = %key, "Cache MISS");
-        }
-        value
-    }
-
-    pub async fn set(&self, key: String, value: SimulationResult) {
-        self.inner.insert(key, value).await;
-    }
-
-    pub fn log_stats(&self) {
-        let hits = self.hits.load(Ordering::Relaxed);
-        let misses = self.misses.load(Ordering::Relaxed);
-        let total = hits + misses;
-        let hit_rate_pct = if total > 0 { hits * 100 / total } else { 0 };
-        tracing::info!(
-            cache.hits = hits,
-            cache.misses = misses,
-            cache.total = total,
-            cache.hit_rate_pct = hit_rate_pct,
-            "Cache statistics"
-        );
-    }
-}
-
-// ── Test-only helpers on SimulationCache ──────────────────────────────────────
-// Placed in a dedicated #[cfg(test)] impl block — the idiomatic Rust pattern
-// that ensures Arc<SimulationCache> deref resolves these methods correctly
-// during test compilation without polluting the public API.
-
-#[cfg(test)]
-impl SimulationCache {
-    fn hit_count(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
-    }
-    fn miss_count(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
-    }
-}
+// SimulationCache has been moved to cache.rs
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
