@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Env};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -190,7 +190,7 @@ fn mul_div_u128(a: u128, b: u128, d: u128) -> (u128, bool) {
     let p1 = a_low * b_high;
     let p2 = a_high * b_low;
     let p3 = a_high * b_high;
-    let mut mid = (p1 & 0xFFFFFFFFFFFFFFFF) + (p2 & 0xFFFFFFFFFFFFFFFF) + (p0 >> 64);
+    let mid = (p1 & 0xFFFFFFFFFFFFFFFF) + (p2 & 0xFFFFFFFFFFFFFFFF) + (p0 >> 64);
     let high = p3 + (p1 >> 64) + (p2 >> 64) + (mid >> 64);
     let low = (mid << 64) | (p0 & 0xFFFFFFFFFFFFFFFF);
     if high >= d {
@@ -213,13 +213,13 @@ pub struct Math;
 
 #[contractimpl]
 impl Math {
-    pub fn exp(e: Env, x: i128) -> Result<i128, MathError> {
+    pub fn exp(_env: Env, x: i128) -> Result<i128, MathError> {
         Fixed(x).exp().map(|f| f.0)
     }
-    pub fn ln(e: Env, x: i128) -> Result<i128, MathError> {
+    pub fn ln(_env: Env, x: i128) -> Result<i128, MathError> {
         Fixed(x).ln().map(|f| f.0)
     }
-    pub fn pow(e: Env, x: i128, y: i128) -> Result<i128, MathError> {
+    pub fn pow(_env: Env, x: i128, y: i128) -> Result<i128, MathError> {
         Fixed(x).pow(Fixed(y)).map(|f| f.0)
     }
 }

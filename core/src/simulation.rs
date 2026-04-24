@@ -603,6 +603,7 @@ impl SimulationEngine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn binary_search_resource(
         &self,
         contract_id: &str,
@@ -1832,7 +1833,10 @@ impl SimulationCache {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
         let total = hits + misses;
-        let hit_rate_pct = if total > 0 { hits * 100 / total } else { 0 };
+        let hit_rate_pct = hits
+            .checked_mul(100)
+            .and_then(|value| value.checked_div(total))
+            .unwrap_or(0);
         tracing::info!(
             cache.hits = hits,
             cache.misses = misses,
