@@ -10,6 +10,7 @@ mod jobs;
 mod parser;
 pub mod rpc_provider;
 mod simulation;
+mod wasm_branch_analysis;
 mod ws;
 
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
@@ -390,6 +391,50 @@ pub struct AnalyzeWasmRequest {
     pub args: Option<Vec<String>>,
 }
 
+/// Request body for the WASM execution-branch analysis endpoint (Issue #101).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AnalyzeWasmBranchesRequest {
+    /// Base64-encoded WASM binary to analyse.
+    #[schema(example = "<base64-encoded .wasm bytes>")]
+    pub wasm_bytes: String,
+    /// Exported function whose execution branches should be enumerated.
+    #[schema(example = "transfer")]
+    pub function_name: String,
+    /// Baseline argument vector used for the first (reference) simulation run.
+    /// Additional permutations are generated automatically.
+    #[schema(example = "[]")]
+    pub args: Option<Vec<String>>,
+}
+
+/// API response for the WASM execution-branch analysis endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WasmBranchAnalysisResponse {
+    /// Name of the analysed function.
+    pub function_name: String,
+    /// Total branch-generating instructions found via static analysis.
+    pub total_branch_count: usize,
+    /// Maximum control-flow nesting depth observed.
+    pub max_nesting_depth: usize,
+    /// Per-category branch counts.
+    pub branch_type_breakdown: crate::wasm_branch_analysis::BranchTypeBreakdown,
+    /// Conservative upper bound on distinct execution paths (capped at 64).
+    pub estimated_paths: usize,
+    /// Inventory of branch points from static analysis.
+    pub branches: Vec<crate::wasm_branch_analysis::BranchInfo>,
+    /// Per-path resource measurements from dynamic simulation.
+    pub simulated_paths: Vec<crate::wasm_branch_analysis::PathResult>,
+    /// Resource consumption for the provided baseline arguments.
+    pub baseline_resources: crate::simulation::SorobanResources,
+    /// Highest resource consumption across all simulated paths.
+    pub worst_case_resources: crate::simulation::SorobanResources,
+    /// Lowest resource consumption across all simulated paths.
+    pub best_case_resources: crate::simulation::SorobanResources,
+    /// Number of distinct resource profiles observed.
+    pub distinct_profiles: usize,
+    /// Human-readable note about path coverage.
+    pub coverage_note: String,
+}
+
 /// Convert a `SimulationResult` (library type) into the API `ResourceReport`.
 fn to_report(result: &SimulationResult, insights_engine: &InsightsEngine) -> ResourceReport {
     let insights_report = insights_engine.analyze(&result.resources);
@@ -601,6 +646,75 @@ async fn analyze_wasm(
     };
 
     Ok(Json(to_report(&sim_result, &state.insights_engine)))
+}
+
+// ── WASM branch analysis handler (Issue #101) ─────────────────────────────────
+
+#[utoipa::path(
+    post,
+    path = "/analyze/wasm/branches",
+    request_body = AnalyzeWasmBranchesRequest,
+    responses(
+        (status = 200, description = "Branch analysis successful", body = WasmBranchAnalysisResponse),
+        (status = 400, description = "Invalid base64 or WASM data"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Branch analysis failed")
+    ),
+    security(
+        ("jwt" = [])
+    ),
+    tag = "Analysis"
+)]
+async fn analyze_wasm_branches(
+    State(_state): State<Arc<AppState>>,
+    Json(payload): Json<AnalyzeWasmBranchesRequest>,
+) -> Result<Json<WasmBranchAnalysisResponse>, AppError> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    use crate::wasm_branch_analysis::analyze_wasm_branches as run_analysis;
+
+    tracing::info!(
+        function_name = %payload.function_name,
+        "Received WASM branch analysis request"
+    );
+
+    let wasm_bytes = BASE64
+        .decode(&payload.wasm_bytes)
+        .map_err(|e| AppError::BadRequest(format!("Invalid base64 WASM data: {}", e)))?;
+
+    let function_name = payload.function_name.clone();
+    let args = payload.args.clone().unwrap_or_default();
+
+    let report = tokio::task::spawn_blocking(move || {
+        run_analysis(wasm_bytes, function_name, args)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Branch analysis task panicked: {}", e)))?
+    .map_err(|e| AppError::Internal(format!("Branch analysis failed: {}", e)))?;
+
+    tracing::info!(
+        function_name = %payload.function_name,
+        total_branch_count = report.total_branch_count,
+        simulated_paths = report.simulated_paths.len(),
+        distinct_profiles = report.distinct_profiles,
+        worst_cpu = report.worst_case_resources.cpu_instructions,
+        worst_ram = report.worst_case_resources.ram_bytes,
+        "Branch analysis completed"
+    );
+
+    Ok(Json(WasmBranchAnalysisResponse {
+        function_name: report.function_name,
+        total_branch_count: report.total_branch_count,
+        max_nesting_depth: report.max_nesting_depth,
+        branch_type_breakdown: report.branch_type_breakdown,
+        estimated_paths: report.estimated_paths,
+        branches: report.branches,
+        simulated_paths: report.simulated_paths,
+        baseline_resources: report.baseline_resources,
+        worst_case_resources: report.worst_case_resources,
+        best_case_resources: report.best_case_resources,
+        distinct_profiles: report.distinct_profiles,
+        coverage_note: report.coverage_note,
+    }))
 }
 
 #[utoipa::path(
@@ -938,14 +1052,19 @@ async fn fee_analytics(
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        analyze, analyze_wasm, optimize_limits, compare_handler,
+        analyze, analyze_wasm, analyze_wasm_branches, optimize_limits, compare_handler,
         auth::challenge_handler, auth::verify_handler,
         fee_recommend, fee_history, fee_analytics
     ),
     components(schemas(
-        AnalyzeRequest, AnalyzeWasmRequest, ResourceReport,
+        AnalyzeRequest, AnalyzeWasmRequest, AnalyzeWasmBranchesRequest,
+        WasmBranchAnalysisResponse, ResourceReport,
         OptimizeLimitsRequest, OptimizeLimitsResponse,
         CompareApiResponse, RegressionReport, ResourceDelta, RegressionFlag,
+        crate::wasm_branch_analysis::BranchInfo,
+        crate::wasm_branch_analysis::BranchType,
+        crate::wasm_branch_analysis::BranchTypeBreakdown,
+        crate::wasm_branch_analysis::PathResult,
         auth::ChallengeRequest, auth::ChallengeResponse,
         auth::VerifyRequest, auth::VerifyResponse,
         crate::simulation::OptimizationBuffer,
@@ -1217,6 +1336,7 @@ async fn main() {
     let protected = Router::new()
         .route("/analyze", post(analyze))
         .route("/analyze/wasm", post(analyze_wasm))
+        .route("/analyze/wasm/branches", post(analyze_wasm_branches))
         .route("/analyze/optimize-limits", post(optimize_limits))
         .route("/analyze/compare", post(compare_handler))
         .route_layer(middleware::from_fn(auth::auth_middleware));
