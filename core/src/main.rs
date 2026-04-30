@@ -2,6 +2,7 @@ mod auth;
 mod benchmarks;
 mod comparison;
 mod errors;
+mod simulation_service;
 pub mod fee_analytics;
 pub mod fee_collector;
 pub mod fee_store;
@@ -15,6 +16,30 @@ mod ws;
 
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
 use crate::errors::AppError;
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
+use simulation_service::{AnalysisResult, SimulationMetric, SimulationService};
+use std::env;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() {
+    let db_path =
+        env::var("SOROSCOPE_DB_PATH").unwrap_or_else(|_| "soroscope_metrics.db".to_string());
+    let webhook_url = env::var("SOROSCOPE_ALERT_WEBHOOK_URL").ok();
+    let simulation_service = match SimulationService::new(db_path, webhook_url) {
+        Ok(service) => Arc::new(service),
+        Err(err) => {
+            eprintln!("Failed to initialize simulation service: {}", err);
+            return;
+        }
+    };
+
+    // CLI Argument Handling
 use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
 use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
 use crate::fee_store::FeeStore;
@@ -1112,6 +1137,9 @@ async fn main() {
         }
 
         if let Some(path) = wasm_path {
+            if let Err(e) = benchmarks::run_token_benchmark(path, simulation_service.as_ref()).await
+            {
+                eprintln!("Benchmark failed: {}", e);
             if let Err(e) = benchmarks::run_token_benchmark(path) {
                 tracing::error!("Benchmark failed: {}", e);
             }
@@ -1124,6 +1152,24 @@ async fn main() {
         return;
     }
 
+    // Default Web Server
+    println!("SoroScope CLI Initialized. Run with 'benchmark' argument to profile token contract.");
+
+    // build our application with a single route
+    let app = Router::new()
+        .route(
+            "/",
+            get(|| async {
+                "Hello from SoroScope! Use POST /simulations/analyze to persist + compare simulation metrics."
+            }),
+        )
+        .route("/health", get(|| async { "ok" }))
+        .route(
+            "/error",
+            get(|| async { Err::<&str, AppError>(AppError::BadRequest("Test error".to_string())) }),
+        )
+        .route("/simulations/analyze", post(analyze_simulation))
+        .with_state(simulation_service);
     // ── CLI: compare subcommand ──────────────────────────────────────────
     if args.len() > 1 && args[1] == "compare" {
         if args.len() < 4 {
@@ -1598,4 +1644,12 @@ mod tests {
         // Default should be 30 seconds
         assert_eq!(engine.timeout(), Duration::from_secs(30));
     }
+}
+
+async fn analyze_simulation(
+    State(simulation_service): State<Arc<SimulationService>>,
+    Json(metric): Json<SimulationMetric>,
+) -> Result<Json<AnalysisResult>, AppError> {
+    let result = simulation_service.record_and_analyze(metric).await?;
+    Ok(Json(result))
 }
