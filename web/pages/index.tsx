@@ -9,6 +9,7 @@ import { ContractInteraction } from '../components/ContractInteraction';
 import { MOCK_CONTRACT_FUNCTIONS, generateMockResult, generateMockResourceCost } from '../lib/sorobantypes';
 import type { ContractFunction, InvocationResult } from '../lib/sorobantypes';
 import { UploadZone } from '../components/upload-zone';
+import { ResourceHeatmap } from '../components/ResourceHeatmap';
 
 export default function Home() {
   const [contractId, setContractId] = useState('CAEZJVJ4N7P7GRUVD5NG5LYYH23AQHJUKQEUHW54LR5PGQX3V7FXD7Q');
@@ -42,6 +43,8 @@ export default function Home() {
         inputs,
         result: generateMockResult(selectedFunction.name, inputs),
         resourceCost: report,
+        stateSnapshot: report.state_snapshot,
+        callGraphMermaid: report.call_graph_mermaid,
         timestamp: Date.now(),
         success: true,
       };
@@ -238,7 +241,16 @@ export default function Home() {
                 <>
                   <ResultViewer result={currentResult} />
                   {currentResult?.resourceCost && (
-                    <div className="mt-4">
+                    <div className="mt-4 flex flex-col gap-4">
+                      <ResourceHeatmap resourceCost={{
+                        cpu_instructions: currentResult.resourceCost.cpu_instructions,
+                        ram_bytes: currentResult.resourceCost.ram_bytes,
+                        ledger_read_bytes: currentResult.resourceCost.ledger_read_bytes,
+                        ledger_write_bytes: currentResult.resourceCost.ledger_write_bytes,
+                        transaction_size_bytes: currentResult.resourceCost.transaction_size_bytes,
+                        cost_stroops: (currentResult.resourceCost as any).cost_stroops,
+                        state_snapshot: currentResult.stateSnapshot
+                      }} />
                       <NutritionLabel
                         cpu_instructions={currentResult.resourceCost.cpu_instructions}
                         ram_bytes={currentResult.resourceCost.ram_bytes}
