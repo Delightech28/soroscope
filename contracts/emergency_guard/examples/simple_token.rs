@@ -156,7 +156,7 @@ impl SimpleToken {
 
     /// Resume transfers
     pub fn resume_transfers(env: Env) {
-        DefaultEmergencyGuard::set_pause_state(&env, PauseType::TRANSFER, false)
+        DefaultEmergencyGuard::unpause(&env, PauseType::TRANSFER)
             .expect("Unauthorized");
     }
 
@@ -167,7 +167,7 @@ impl SimpleToken {
 
     /// Resume minting
     pub fn resume_minting(env: Env) {
-        DefaultEmergencyGuard::set_pause_state(&env, PauseType::MINT, false).expect("Unauthorized");
+        DefaultEmergencyGuard::unpause(&env, PauseType::MINT).expect("Unauthorized");
     }
 
     /// Pause only burning
@@ -177,7 +177,7 @@ impl SimpleToken {
 
     /// Resume burning
     pub fn resume_burning(env: Env) {
-        DefaultEmergencyGuard::set_pause_state(&env, PauseType::BURN, false).expect("Unauthorized");
+        DefaultEmergencyGuard::unpause(&env, PauseType::BURN).expect("Unauthorized");
     }
 
     /// Emergency: pause all operations
@@ -187,7 +187,7 @@ impl SimpleToken {
 
     /// Resume all operations
     pub fn resume_all(env: Env) {
-        DefaultEmergencyGuard::resume_all(&env).expect("Unauthorized");
+        DefaultEmergencyGuard::unpause_all(&env).expect("Unauthorized");
     }
 
     /// Get current pause state (bitmask)
