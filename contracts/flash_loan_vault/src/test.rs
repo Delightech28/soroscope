@@ -1,46 +1,52 @@
 use super::*;
 use soroban_sdk::{
-    contract, contractimpl, contracttype,
-    testutils::Address as _,
-    Address, Env, String as SorobanString,
+    contract, contractimpl, contracttype, testutils::Address as _, Address, Env,
+    String as SorobanString,
 };
 
 // ── Mock receivers ───────────────────────────────────────────────────────────
 
 pub mod good {
-use super::*;
-/// A well-behaved receiver that repays amount + fee.
-#[contract]
-pub struct GoodReceiver;
+    use super::*;
+    /// A well-behaved receiver that repays amount + fee.
+    #[contract]
+    pub struct GoodReceiver;
 
-#[contractimpl]
-impl GoodReceiver {
-    pub fn execute_operation(
-        e: Env,
-        token: Address,
-        amount: i128,
-        fee: i128,
-        _initiator: Address,
-    ) {
-        // Repay amount + fee back to the caller (the vault).
-        let vault = e.storage().instance().get(&good::GoodReceiverDataKey::Vault).unwrap();
-        soroban_sdk::token::Client::new(&e, &token)
-            .transfer(&e.current_contract_address(), &vault, &(amount + fee));
+    #[contractimpl]
+    impl GoodReceiver {
+        pub fn execute_operation(
+            e: Env,
+            token: Address,
+            amount: i128,
+            fee: i128,
+            _initiator: Address,
+        ) {
+            // Repay amount + fee back to the caller (the vault).
+            let vault = e
+                .storage()
+                .instance()
+                .get(&good::GoodReceiverDataKey::Vault)
+                .unwrap();
+            soroban_sdk::token::Client::new(&e, &token).transfer(
+                &e.current_contract_address(),
+                &vault,
+                &(amount + fee),
+            );
+        }
+
+        /// Helper: store the vault address so the receiver knows where to repay.
+        pub fn set_vault(e: Env, vault: Address) {
+            e.storage()
+                .instance()
+                .set(&good::GoodReceiverDataKey::Vault, &vault);
+        }
     }
 
-    /// Helper: store the vault address so the receiver knows where to repay.
-    pub fn set_vault(e: Env, vault: Address) {
-        e.storage()
-            .instance()
-            .set(&good::GoodReceiverDataKey::Vault, &vault);
+    #[contracttype]
+    #[derive(Clone)]
+    enum GoodReceiverDataKey {
+        Vault,
     }
-}
-
-#[contracttype]
-#[derive(Clone)]
-enum GoodReceiverDataKey {
-    Vault,
-}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,131 +71,140 @@ impl BadReceiver {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub mod partial {
-use super::*;
-/// A receiver that only repays part of the loan (amount but not fee).
-#[contract]
-pub struct PartialReceiver;
+    use super::*;
+    /// A receiver that only repays part of the loan (amount but not fee).
+    #[contract]
+    pub struct PartialReceiver;
 
-#[contractimpl]
-impl PartialReceiver {
-    pub fn execute_operation(
-        e: Env,
-        token: Address,
-        amount: i128,
-        _fee: i128,
-        _initiator: Address,
-    ) {
-        // Repay only the principal, not the fee.
-        let vault: Address = e
-            .storage()
-            .instance()
-            .get(&partial::PartialReceiverDataKey::Vault)
-            .unwrap();
-        soroban_sdk::token::Client::new(&e, &token)
-            .transfer(&e.current_contract_address(), &vault, &amount);
+    #[contractimpl]
+    impl PartialReceiver {
+        pub fn execute_operation(
+            e: Env,
+            token: Address,
+            amount: i128,
+            _fee: i128,
+            _initiator: Address,
+        ) {
+            // Repay only the principal, not the fee.
+            let vault: Address = e
+                .storage()
+                .instance()
+                .get(&partial::PartialReceiverDataKey::Vault)
+                .unwrap();
+            soroban_sdk::token::Client::new(&e, &token).transfer(
+                &e.current_contract_address(),
+                &vault,
+                &amount,
+            );
+        }
+
+        pub fn set_vault(e: Env, vault: Address) {
+            e.storage()
+                .instance()
+                .set(&partial::PartialReceiverDataKey::Vault, &vault);
+        }
     }
 
-    pub fn set_vault(e: Env, vault: Address) {
-        e.storage()
-            .instance()
-            .set(&partial::PartialReceiverDataKey::Vault, &vault);
+    #[contracttype]
+    #[derive(Clone)]
+    enum PartialReceiverDataKey {
+        Vault,
     }
-}
-
-#[contracttype]
-#[derive(Clone)]
-enum PartialReceiverDataKey {
-    Vault,
-}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub mod overpay {
-use super::*;
-/// A receiver that overpays (returns more than required).
-#[contract]
-pub struct OverpayReceiver;
+    use super::*;
+    /// A receiver that overpays (returns more than required).
+    #[contract]
+    pub struct OverpayReceiver;
 
-#[contractimpl]
-impl OverpayReceiver {
-    pub fn execute_operation(
-        e: Env,
-        token: Address,
-        amount: i128,
-        fee: i128,
-        _initiator: Address,
-    ) {
-        let vault: Address = e
-            .storage()
-            .instance()
-            .get(&overpay::OverpayReceiverDataKey::Vault)
-            .unwrap();
-        // Overpay by 100 extra.
-        let overpay = amount + fee + 100;
-        soroban_sdk::token::Client::new(&e, &token)
-            .transfer(&e.current_contract_address(), &vault, &overpay);
+    #[contractimpl]
+    impl OverpayReceiver {
+        pub fn execute_operation(
+            e: Env,
+            token: Address,
+            amount: i128,
+            fee: i128,
+            _initiator: Address,
+        ) {
+            let vault: Address = e
+                .storage()
+                .instance()
+                .get(&overpay::OverpayReceiverDataKey::Vault)
+                .unwrap();
+            // Overpay by 100 extra.
+            let overpay = amount + fee + 100;
+            soroban_sdk::token::Client::new(&e, &token).transfer(
+                &e.current_contract_address(),
+                &vault,
+                &overpay,
+            );
+        }
+
+        pub fn set_vault(e: Env, vault: Address) {
+            e.storage()
+                .instance()
+                .set(&overpay::OverpayReceiverDataKey::Vault, &vault);
+        }
     }
 
-    pub fn set_vault(e: Env, vault: Address) {
-        e.storage()
-            .instance()
-            .set(&overpay::OverpayReceiverDataKey::Vault, &vault);
+    #[contracttype]
+    #[derive(Clone)]
+    enum OverpayReceiverDataKey {
+        Vault,
     }
-}
-
-#[contracttype]
-#[derive(Clone)]
-enum OverpayReceiverDataKey {
-    Vault,
-}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub mod reentrant {
-use super::*;
-/// A receiver that tries to re-enter flash_loan during the callback.
-#[contract]
-pub struct ReentrantReceiver;
+    use super::*;
+    /// A receiver that tries to re-enter flash_loan during the callback.
+    #[contract]
+    pub struct ReentrantReceiver;
 
-#[contractimpl]
-impl ReentrantReceiver {
-    pub fn execute_operation(
-        e: Env,
-        token: Address,
-        amount: i128,
-        fee: i128,
-        initiator: Address,
-    ) {
-        let vault: Address = e
-            .storage()
-            .instance()
-            .get(&reentrant::ReentrantReceiverDataKey::Vault)
-            .unwrap();
+    #[contractimpl]
+    impl ReentrantReceiver {
+        pub fn execute_operation(
+            e: Env,
+            token: Address,
+            amount: i128,
+            fee: i128,
+            initiator: Address,
+        ) {
+            let vault: Address = e
+                .storage()
+                .instance()
+                .get(&reentrant::ReentrantReceiverDataKey::Vault)
+                .unwrap();
 
-        // Try to re-enter the vault with another flash loan.
-        let vault_client = FlashLoanVaultClient::new(&e, &vault);
-        // This should fail with Reentrancy error.
-        vault_client.flash_loan(&initiator, &e.current_contract_address(), &amount);
+            // Try to re-enter the vault with another flash loan.
+            let vault_client = FlashLoanVaultClient::new(&e, &vault);
+            // This should fail with Reentrancy error.
+            vault_client.flash_loan(&initiator, &e.current_contract_address(), &amount);
 
-        // If we somehow get here, repay the original loan.
-        soroban_sdk::token::Client::new(&e, &token)
-            .transfer(&e.current_contract_address(), &vault, &(amount + fee));
+            // If we somehow get here, repay the original loan.
+            soroban_sdk::token::Client::new(&e, &token).transfer(
+                &e.current_contract_address(),
+                &vault,
+                &(amount + fee),
+            );
+        }
+
+        pub fn set_vault(e: Env, vault: Address) {
+            e.storage()
+                .instance()
+                .set(&reentrant::ReentrantReceiverDataKey::Vault, &vault);
+        }
     }
 
-    pub fn set_vault(e: Env, vault: Address) {
-        e.storage()
-            .instance()
-            .set(&reentrant::ReentrantReceiverDataKey::Vault, &vault);
+    #[contracttype]
+    #[derive(Clone)]
+    enum ReentrantReceiverDataKey {
+        Vault,
     }
-}
-
-#[contracttype]
-#[derive(Clone)]
-enum ReentrantReceiverDataKey {
-    Vault,
-}
 }
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
@@ -397,30 +412,30 @@ fn test_flash_loan_borrow_entire_vault() {
 // fn test_flash_loan_no_repay() {
 //     let s = setup();
 //     fund_vault(&s, 10_000);
-// 
+//
 //     let receiver_id = s.e.register(bad::BadReceiver, ());
 //     let initiator = Address::generate(&s.e);
-// 
+//
 //     // Bad receiver doesn't repay — entire transaction should revert.
 //     s.vault_client
 //         .flash_loan(&initiator, &receiver_id, &5_000);
 // }
-// 
+//
 // #[test]
 // #[should_panic(expected = "flash loan not repaid")]
 // fn test_flash_loan_partial_repay() {
 //     let s = setup();
 //     fund_vault(&s, 10_000);
-// 
+//
 //     // Set fee so partial repay (principal only) is insufficient.
 //     s.vault_client.set_fee(&100);
-// 
+//
 //     let receiver_id = s.e.register(partial::PartialReceiver, ());
 //     let receiver_client = partial::PartialReceiverClient::new(&s.e, &receiver_id);
 //     receiver_client.set_vault(&s.vault_id);
-// 
+//
 //     let initiator = Address::generate(&s.e);
-// 
+//
 //     // Partial receiver repays principal but not fee → revert.
 //     s.vault_client
 //         .flash_loan(&initiator, &receiver_id, &5_000);
@@ -463,8 +478,7 @@ fn test_reentrancy_guard() {
 
     // Reentrant receiver tries to call flash_loan again during callback.
     // Should fail with Reentrancy error.
-    s.vault_client
-        .flash_loan(&initiator, &receiver_id, &5_000);
+    s.vault_client.flash_loan(&initiator, &receiver_id, &5_000);
 }
 
 // ── Flash loan: edge cases ───────────────────────────────────────────────────
@@ -479,8 +493,7 @@ fn test_flash_loan_exceeds_vault_balance() {
     let initiator = Address::generate(&s.e);
 
     // Borrow more than available.
-    s.vault_client
-        .flash_loan(&initiator, &receiver_id, &5_000);
+    s.vault_client.flash_loan(&initiator, &receiver_id, &5_000);
 }
 
 #[test]
@@ -492,8 +505,7 @@ fn test_flash_loan_zero_amount() {
     let receiver_id = s.e.register(good::GoodReceiver, ());
     let initiator = Address::generate(&s.e);
 
-    s.vault_client
-        .flash_loan(&initiator, &receiver_id, &0);
+    s.vault_client.flash_loan(&initiator, &receiver_id, &0);
 }
 
 #[test]
@@ -505,8 +517,7 @@ fn test_flash_loan_negative_amount() {
     let receiver_id = s.e.register(good::GoodReceiver, ());
     let initiator = Address::generate(&s.e);
 
-    s.vault_client
-        .flash_loan(&initiator, &receiver_id, &-100);
+    s.vault_client.flash_loan(&initiator, &receiver_id, &-100);
 }
 
 // ── Multiple flash loans in sequence ─────────────────────────────────────────

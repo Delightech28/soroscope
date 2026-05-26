@@ -57,7 +57,6 @@ impl TypedDataAuth {
 impl TypedDataAuth {
     /// Computes the domain separator hash.
     fn domain_separator_hash(env: &Env, domain: &Domain) -> BytesN<32> {
-        
         let mut data = Bytes::new(env);
         data.append(&Bytes::from_slice(
             env,
@@ -71,7 +70,6 @@ impl TypedDataAuth {
 
     /// Computes the struct hash for Transfer.
     fn struct_hash(env: &Env, transfer: &Transfer) -> BytesN<32> {
-        
         let mut data = Bytes::new(env);
         data.append(&Bytes::from_slice(
             env,
