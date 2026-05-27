@@ -6,8 +6,8 @@ import { InvocationHistory, useInvocationHistory } from '../components/Innovocat
 import { NutritionLabel } from '../components/NutritionLabel';
 import { FunctionSidebar } from '../components/FunctionSidebar';
 import { ContractInteraction } from '../components/ContractInteraction';
-import { MOCK_CONTRACT_FUNCTIONS, generateMockResult, generateMockResourceCost } from '../lib/sorobantypes';
-import type { ContractFunction, InvocationResult } from '../lib/sorobantypes';
+import { MOCK_CONTRACT_FUNCTIONS, generateMockResult } from '../lib/sorobantypes';
+import type { AnalyzeResponse, ContractFunction, InvocationResult } from '../lib/sorobantypes';
 import { UploadZone } from '../components/upload-zone';
 
 export default function Home() {
@@ -34,13 +34,14 @@ export default function Home() {
         throw new Error(`Backend error: ${response.statusText}`);
       }
 
-      const report = await response.json();
+      const report: AnalyzeResponse = await response.json();
 
       const result: InvocationResult = {
         id: Math.random().toString(36).substring(7),
         functionName: selectedFunction.name,
         inputs,
         result: generateMockResult(selectedFunction.name, inputs),
+        analysisReport: report,
         resourceCost: report,
         timestamp: Date.now(),
         success: true,
@@ -63,6 +64,8 @@ export default function Home() {
       setLoading(false);
     }
   };
+
+  const analysisReport = currentResult?.analysisReport ?? currentResult?.resourceCost;
 
   return (
     <div style={{ minHeight: '100vh', backgroundColor: '#0f1117' }}>
@@ -237,14 +240,14 @@ export default function Home() {
               {tab === 'explorer' ? (
                 <>
                   <ResultViewer result={currentResult} />
-                  {currentResult?.resourceCost && (
+                  {analysisReport && (
                     <div className="mt-4">
                       <NutritionLabel
-                        cpu_instructions={currentResult.resourceCost.cpu_instructions}
-                        ram_bytes={currentResult.resourceCost.ram_bytes}
-                        ledger_read_bytes={currentResult.resourceCost.ledger_read_bytes}
-                        ledger_write_bytes={currentResult.resourceCost.ledger_write_bytes}
-                        transaction_size_bytes={currentResult.resourceCost.transaction_size_bytes}
+                        cpu_instructions={analysisReport.cpu_instructions}
+                        ram_bytes={analysisReport.ram_bytes}
+                        ledger_read_bytes={analysisReport.ledger_read_bytes}
+                        ledger_write_bytes={analysisReport.ledger_write_bytes}
+                        transaction_size_bytes={analysisReport.transaction_size_bytes}
                       />
                     </div>
                   )}
