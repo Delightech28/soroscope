@@ -21,6 +21,7 @@ export default function Home() {
 
   const handleSimulate = async (inputs: Record<string, any>) => {
     setLoading(true);
+    let errorType: string | undefined;
     try {
       const response = await fetch('http://localhost:8080/analyze', {
         method: 'POST',
@@ -34,6 +35,7 @@ export default function Home() {
       if (!response.ok) {
         // Parse error response from backend
         const errorResponse = await extractErrorDetails(response);
+        errorType = errorResponse.error;
         const userMessage = createUserFriendlyMessage(errorResponse);
         throw new Error(userMessage);
       }
@@ -60,6 +62,7 @@ export default function Home() {
         functionName: selectedFunction.name,
         inputs,
         error: errorMessage,
+        errorType: errorType || 'UNKNOWN_ERROR',
         timestamp: Date.now(),
         success: false,
       };

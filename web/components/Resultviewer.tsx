@@ -99,8 +99,24 @@ export function ResultViewer({ result }: ResultViewerProps) {
           }}
         >
           <div style={{ marginBottom: '12px' }}>
-            <div style={{ color: '#fb8500', fontWeight: '600', marginBottom: '4px' }}>
+            <div style={{ color: '#fb8500', fontWeight: '600', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
               Error Details
+              {result.errorType && (
+                <span
+                  style={{
+                    fontSize: '11px',
+                    backgroundColor: '#2d1810',
+                    color: '#f0883e',
+                    padding: '2px 8px',
+                    borderRadius: '3px',
+                    border: '1px solid #fb8500',
+                    fontFamily: 'monospace',
+                    fontWeight: 'normal',
+                  }}
+                >
+                  {result.errorType}
+                </span>
+              )}
             </div>
             <div
               style={{
