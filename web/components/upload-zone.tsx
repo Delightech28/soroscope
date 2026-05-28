@@ -168,9 +168,10 @@ function ErrorIcon() {
 export interface UploadZoneProps {
   /** Called with the validated File once scanning completes */
   onFileReady?: (file: File) => void;
+  onReset?: () => void;
 }
 
-export function UploadZone({ onFileReady }: UploadZoneProps) {
+export function UploadZone({ onFileReady, onReset }: UploadZoneProps) {
   const [uploadState, setUploadState] = useState<UploadState>('idle');
   const [droppedFile, setDroppedFile] = useState<DroppedFile | null>(null);
   const [errorMessage, setErrorMessage] = useState<string>('');
@@ -261,6 +262,7 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
     setDroppedFile(null);
     setErrorMessage('');
     setUnexpectedError(null);
+    onReset?.();
   };
 
   // ── Dynamic border & bg classes ──────────────────────────────────────────────
