@@ -8,10 +8,10 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::cache::SimulationCache;
     use crate::simulation::{
-        CallGraph, CallNode, ExtendTtlSuggestion, SimulationCache, SimulationEngine,
-        SimulationResult, SimulationStateSnapshot, SorobanResources, TtlAnalysisReport,
-        TtlEntryReport,
+        CallGraph, CallNode, SimulationEngine, SimulationResult, SimulationStateSnapshot,
+        SorobanResources, TtlEntryReport,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;
@@ -24,10 +24,6 @@ mod tests {
     }
 
     /// Arbitrary short ASCII-only identifier.
-    fn arb_identifier() -> impl Strategy<Value = String> {
-        "[a-zA-Z_][a-zA-Z0-9_]{0,31}"
-    }
-
     /// Arbitrary `SorobanResources`.
     fn arb_resources() -> impl Strategy<Value = SorobanResources> {
         (
@@ -97,6 +93,7 @@ mod tests {
                 transaction_data: td,
                 call_graph: None,
                 state_snapshot: None,
+                protocol_version: 0,
             })
     }
 
@@ -127,7 +124,7 @@ mod tests {
         #[test]
         fn fuzz_parse_sc_val_arg_void(input in prop::sample::select(vec!["void", "()"])) {
             let engine = SimulationEngine::new("https://test.com".into());
-            let result = engine.parse_sc_val_arg(&input);
+            let result = engine.parse_sc_val_arg(input);
             prop_assert!(result.is_ok());
         }
 
@@ -240,9 +237,7 @@ mod tests {
         #[test]
         fn fuzz_extract_footprint_no_panic(input in arb_short_string()) {
             let engine = SimulationEngine::new("https://test.com".into());
-            let (r, w) = engine.extract_footprint_from_xdr(&input);
-            // Just verifying it returns without panic; values >= 0.
-            prop_assert!(r >= 0 || w >= 0 || true);
+            let _ = engine.extract_footprint_from_xdr(&input);
         }
 
         /// Empty input must return (0, 0).
@@ -261,9 +256,7 @@ mod tests {
             input in "[a-zA-Z0-9+/=]{0,128}"
         ) {
             let engine = SimulationEngine::new("https://test.com".into());
-            let keys = engine.extract_touched_ledger_keys(&input);
-            // Result is always a Vec<String>, possibly empty.
-            prop_assert!(keys.len() < usize::MAX);
+            let _ = engine.extract_touched_ledger_keys(&input);
         }
 
         /// Empty input returns empty Vec.
@@ -319,9 +312,8 @@ mod tests {
         #[test]
         fn fuzz_calculate_cost_no_panic(resources in arb_resources()) {
             let engine = SimulationEngine::new("https://test.com".into());
-            let cost = engine.calculate_cost(&resources);
+            let _cost = engine.calculate_cost(&resources);
             // Cost is computed via integer division — always finite.
-            prop_assert!(cost <= u64::MAX);
         }
 
         /// Deterministic: same inputs → same cost.

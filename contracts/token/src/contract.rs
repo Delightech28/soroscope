@@ -2,7 +2,7 @@ use crate::admin::{has_administrator, read_administrator, write_administrator};
 use crate::allowance::{read_allowance, spend_allowance, write_allowance};
 use crate::balance::{read_balance, receive_balance, spend_balance};
 use crate::metadata::{read_decimal, read_name, read_symbol, write_metadata};
-use emergency_guard::{EmergencyGuard, GuardError, PauseType};
+use emergency_guard::{DataKey as GuardDataKey, EmergencyGuard, GuardError, PauseType};
 use soroban_sdk::{contract, contractimpl, vec, Address, Env, String, Vec};
 
 fn require_not_paused(e: &Env, operation: u32) {
@@ -72,11 +72,35 @@ impl TokenTrait for Token {
         let admin = read_administrator(&e);
         admin.require_auth();
         e.storage().instance().extend_ttl(100, 100);
+        if admin == new_admin {
+            write_administrator(&e, &new_admin);
+            return;
+        }
 
-        EmergencyGuard::add_admin(e.clone(), vec![&e, admin.clone()], new_admin.clone())
-            .expect("failed to add token admin");
-        EmergencyGuard::remove_admin(e.clone(), vec![&e, admin.clone()], admin)
-            .expect("failed to remove old token admin");
+        let admins = EmergencyGuard::get_admins(e.clone());
+        let mut rotated_admins = Vec::new(&e);
+        let mut has_new_admin = false;
+        let mut replaced_old_admin = false;
+        for guard_admin in admins.iter() {
+            if guard_admin == new_admin {
+                has_new_admin = true;
+            }
+            if guard_admin == admin {
+                replaced_old_admin = true;
+                if !has_new_admin {
+                    rotated_admins.push_back(new_admin.clone());
+                    has_new_admin = true;
+                }
+            } else {
+                rotated_admins.push_back(guard_admin);
+            }
+        }
+        if !replaced_old_admin && !has_new_admin {
+            rotated_admins.push_back(new_admin.clone());
+        }
+        e.storage()
+            .instance()
+            .set(&GuardDataKey::Admins, &rotated_admins);
         write_administrator(&e, &new_admin);
     }
 

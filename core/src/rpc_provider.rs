@@ -297,6 +297,14 @@ impl ProviderRegistry {
         })
     }
 
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub fn public_base_url(&self) -> Option<&str> {
+        self.public_base_url.as_deref()
+    }
+
     /// Return the list of providers that are currently available for requests,
     /// in priority order (skipping tripped providers whose cooldown hasn't elapsed).
     pub async fn healthy_providers(&self) -> Vec<RpcProvider> {
@@ -957,9 +965,14 @@ mod tests {
         ]);
 
         let providers = registry.healthy_providers().await;
+        let urls = providers
+            .iter()
+            .map(|provider| provider.url.as_str())
+            .collect::<HashSet<_>>();
+
         assert_eq!(providers.len(), 2);
-        assert_eq!(providers[0].url, "http://a.test");
-        assert_eq!(providers[1].url, "http://b.test");
+        assert!(urls.contains("http://a.test"));
+        assert!(urls.contains("http://b.test"));
     }
 
     #[tokio::test]

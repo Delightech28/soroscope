@@ -52,6 +52,7 @@ impl AuthState {
                 seed
             }
         };
+        let signing_key = SigningKey::from_bytes(&seed);
         let server_public_key = signing_key.verifying_key().to_bytes();
 
         let priv_key = if let Some(pem) = jwt_private_key_pem {
@@ -301,12 +302,12 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
 
     for ds in sigs {
         let sig_bytes: &[u8] = ds.signature.as_ref();
-        let Ok(sig) = Ed25519Signature::from_bytes(sig_bytes) else {
+        let Ok(sig) = Ed25519Signature::try_from(sig_bytes) else {
             continue;
         };
 
         if ds.hint.0 == server_hint {
-            if let Ok(vk) = PublicKey::from_bytes(&state.server_public_key) {
+            if let Ok(vk) = VerifyingKey::from_bytes(&state.server_public_key) {
                 if vk.verify(&hash, &sig).is_ok() {
                     server_ok = true;
                 }
@@ -314,7 +315,7 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
         }
 
         if ds.hint.0 == client_hint {
-            if let Ok(vk) = PublicKey::from_bytes(&client_key) {
+            if let Ok(vk) = VerifyingKey::from_bytes(&client_key) {
                 if vk.verify(&hash, &sig).is_ok() {
                     client_ok = true;
                 }

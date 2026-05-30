@@ -24,6 +24,12 @@ pub struct GasGolfingReport {
 
 pub struct GasGolfingAnalyzer;
 
+impl Default for GasGolfingAnalyzer {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl GasGolfingAnalyzer {
     pub fn new() -> Self {
         Self

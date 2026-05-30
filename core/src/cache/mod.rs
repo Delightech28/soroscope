@@ -1,4 +1,5 @@
 //! Two-tier simulation cache: in-memory L1 + disk-persistent L2.
+#![allow(unused_imports)]
 //!
 //! The in-memory side (Moka) lives on [`crate::simulation::SimulationCache`]
 //! for backward compatibility; this module only ships the L2 layer plus the
@@ -105,7 +106,10 @@ impl SimulationCache {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
         let total = hits + misses;
-        let hit_rate_pct = if total > 0 { hits * 100 / total } else { 0 };
+        let hit_rate_pct = hits
+            .checked_mul(100)
+            .and_then(|v| v.checked_div(total))
+            .unwrap_or(0);
         tracing::info!(
             cache.hits = hits,
             cache.misses = misses,
@@ -113,6 +117,14 @@ impl SimulationCache {
             cache.hit_rate_pct = hit_rate_pct,
             "Cache statistics"
         );
+    }
+
+    pub fn hit_count(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    pub fn miss_count(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
     }
 }
 

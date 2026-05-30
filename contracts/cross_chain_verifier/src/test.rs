@@ -6,7 +6,7 @@ use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, Vec};
 #[test]
 fn test_initialization() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let contract_id = env.register(CrossChainVerifier, ());
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -17,7 +17,7 @@ fn test_initialization() {
 #[should_panic(expected = "already initialized")]
 fn test_double_initialization() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let contract_id = env.register(CrossChainVerifier, ());
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -30,7 +30,7 @@ fn test_root_update() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let contract_id = env.register(CrossChainVerifier, ());
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -50,7 +50,7 @@ fn test_verify_message_success() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let contract_id = env.register(CrossChainVerifier, ());
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -100,7 +100,7 @@ fn test_verify_message_success() {
 #[should_panic(expected = "State root not found")]
 fn test_verify_message_no_root() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let contract_id = env.register(CrossChainVerifier, ());
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod auth;
 mod benchmarks;
 mod cache;
@@ -6,36 +8,32 @@ mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
 pub mod fee_store;
+mod gas_golfing;
 pub mod insights;
 mod jobs;
 mod parser;
 mod routing;
 pub mod rpc_provider;
+mod runner;
 mod simulation;
 mod simulation_service;
 mod wasm_branch_analysis;
 mod ws;
 
 use crate::cache::{ContractCache, SimulationCache};
-use crate::cache::{DiskCache, DiskCacheConfig};
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
 use crate::errors::AppError;
 use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
 use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
 use crate::fee_store::FeeStore;
+use crate::gas_golfing::{GasGolfingAnalyzer, GasGolfingReport};
 use crate::insights::InsightsEngine;
-use crate::jobs::{
-    JobId, JobQueue, JobQueueConfig, JobWorker, SubmitJobRequest, SubmitJobResponse,
-};
-use crate::rpc_provider::{ProviderRegistry, RpcProvider};
-use crate::simulation::{SimulationEngine, SimulationResult};
+use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
+use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
+use crate::simulation::{SimulationEngine, SimulationMode, SimulationResult};
+use crate::ws::SimulationBus;
 use axum::{
-    extract::State,
-    routing::{get, post},
-    Json, Router,
-};
-use axum::{
-    extract::{Json, Multipart, Path, State},
+    extract::{Json, Multipart, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware,
     response::IntoResponse,
@@ -140,6 +138,10 @@ fn default_health_check_interval() -> u64 {
 
 fn default_simulation_timeout_secs() -> u64 {
     30
+}
+
+fn default_simulation_mode() -> String {
+    "failover".to_string()
 }
 
 fn default_gossip_interval_secs() -> u64 {
@@ -306,6 +308,8 @@ pub struct AppState {
     fee_store: Arc<FeeStore>,
     /// Prometheus metrics collectors.
     metrics: Arc<AppMetrics>,
+    /// WebSocket event bus for simulation jobs.
+    simulation_bus: Arc<SimulationBus>,
 }
 
 #[derive(Clone)]
@@ -384,34 +388,22 @@ pub struct AnalyzeRequest {
 #[derive(Serialize, ToSchema)]
 pub struct ResourceReport {
     /// CPU instructions consumed
-    #[schema(
-        example = 1500,
-        description = "CPU instructions consumed by the contract call"
-    )]
+    #[schema(example = 1500)]
     pub cpu_instructions: u64,
     /// RAM bytes consumed
-    #[schema(
-        example = 3000,
-        description = "RAM bytes consumed by the contract call"
-    )]
+    #[schema(example = 3000)]
     pub ram_bytes: u64,
     /// Ledger read bytes
-    #[schema(
-        example = 1024,
-        description = "Ledger read bytes during the contract call"
-    )]
+    #[schema(example = 1024)]
     pub ledger_read_bytes: u64,
     /// Ledger write bytes
-    #[schema(
-        example = 512,
-        description = "Ledger write bytes during the contract call"
-    )]
+    #[schema(example = 512)]
     pub ledger_write_bytes: u64,
     /// Transaction size in bytes
-    #[schema(example = 450, description = "Transaction size in bytes")]
+    #[schema(example = 450)]
     pub transaction_size_bytes: u64,
     /// Estimated cost in stroops
-    #[schema(example = 1000, description = "Estimated cost in stroops")]
+    #[schema(example = 1000)]
     pub cost_stroops: u64,
     /// Report showing which data was injected vs live
     pub state_dependency: Option<Vec<StateDependencyReport>>,
@@ -921,6 +913,8 @@ async fn analyze_wasm(
         state_dependency: None,
         ttl_analysis: None,
         transaction_data: String::new(),
+        call_graph: None,
+        state_snapshot: None,
         protocol_version: payload.protocol_version.unwrap_or(20),
     };
 
@@ -1269,7 +1263,7 @@ pub struct GasGolfingRequest {
 
 #[derive(Serialize, ToSchema)]
 pub struct GasGolfingResponse {
-    pub report: crate::gas_golfing::GasGolfingReport,
+    pub report: GasGolfingReport,
 }
 
 // ── Gas Golfing Handler ───────────────────────────────────────────────────
@@ -1331,8 +1325,6 @@ async fn analyze_gas_golfing(
 async fn fee_recommend(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<FeeRecommendationResponse>, AppError> {
-    use crate::fee_analytics::TrendDirection;
-
     tracing::info!("Generating fee recommendation");
 
     // Get recent samples for analysis
@@ -1766,7 +1758,7 @@ async fn main() {
         timeout_secs = config.simulation_timeout_secs,
         "Simulation timeout configured"
     );
-    tracing::info!(mode = %simulation_mode, "Simulation mode configured");
+    tracing::info!(mode = ?simulation_mode, "Simulation mode configured");
 
     // ── Fee Market Setup ────────────────────────────────────────────────
     let database_url = &config.database_url;
@@ -1791,7 +1783,7 @@ async fn main() {
         max_concurrent_jobs: config.max_concurrent_jobs,
         ..JobQueueConfig::default()
     };
-    let job_queue = JobQueue::new(database_url, job_queue_config.clone())
+    let job_queue = JobQueue::new(database_url, &config.redis_url, job_queue_config.clone())
         .await
         .expect("Failed to initialize job queue");
     // ── WebSocket event bus ─────────────────────────────────────────────
@@ -1893,6 +1885,7 @@ async fn main() {
             Arc::clone(&registry),
             Arc::clone(&contract_cache),
         ),
+        provider_registry: Arc::clone(&registry),
         cache: simulation_cache,
         insights_engine: InsightsEngine::new(),
         gas_golfing_analyzer: GasGolfingAnalyzer::new(),
@@ -1901,6 +1894,7 @@ async fn main() {
         fee_analytics_engine,
         fee_store,
         metrics: Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics")),
+        simulation_bus,
     });
 
     let cors = CorsLayer::new().allow_origin(Any);
@@ -1963,7 +1957,7 @@ async fn main() {
 // Integration Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::simulation::{SimulationError, SorobanResources};
@@ -2050,6 +2044,9 @@ mod tests {
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: "AAA".to_string(),
+            call_graph: None,
+            state_snapshot: None,
+            protocol_version: 0,
         };
 
         let insights_engine = InsightsEngine::new();

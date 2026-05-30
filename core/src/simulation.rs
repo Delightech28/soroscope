@@ -147,8 +147,6 @@ pub struct WasmInstrumenter {
     func_names: Vec<String>,
     /// Maps exported function name → absolute function index.
     export_map: HashMap<String, u32>,
-    /// Number of imported functions (offset for defined function indices).
-    import_func_count: u32,
 }
 
 impl WasmInstrumenter {
@@ -216,7 +214,6 @@ impl WasmInstrumenter {
         Ok(WasmInstrumenter {
             func_names,
             export_map,
-            import_func_count,
         })
     }
 
@@ -960,6 +957,7 @@ struct SimulationRpcResult {
     #[serde(default)]
     cost: Option<ResourceCost>,
     #[serde(default)]
+    #[allow(dead_code)]
     results: Vec<serde_json::Value>,
     /// Diagnostic events (base64 encoded XDR)
     #[serde(default)]
@@ -1200,7 +1198,7 @@ impl SimulationEngine {
         );
 
         // We need a provider URL to fetch from.
-        let (url, auth_h, auth_v) = match &self.registry {
+        let (url, auth_header, auth_value) = match &self.registry {
             Some(reg) => {
                 let p = reg
                     .healthy_providers()
@@ -1224,10 +1222,11 @@ impl SimulationEngine {
             },
         };
 
-        let response: GetLedgerEntriesResponse = self
-            .client
-            .post(&url)
-            .json(&req)
+        let mut req_builder = self.client.post(&url).json(&req);
+        if let (Some(header), Some(value)) = (auth_header.as_deref(), auth_value.as_deref()) {
+            req_builder = req_builder.header(header, value);
+        }
+        let response: GetLedgerEntriesResponse = req_builder
             .send()
             .await?
             .json()
@@ -2505,8 +2504,11 @@ impl SimulationEngine {
                     return None;
                 }
 
-                let target = latest_ledger as i64 + Self::TTL_TARGET_LEDGERS_AHEAD;
-                let extend_to_ledger = target.max(entry.live_until_ledger as i64) as u32;
+                let latest_ledger_i64 = i64::try_from(latest_ledger).unwrap_or(i64::MAX);
+                let target = latest_ledger_i64.saturating_add(Self::TTL_TARGET_LEDGERS_AHEAD);
+                let extend_to_ledger = target
+                    .max(entry.live_until_ledger as i64)
+                    .clamp(0, u32::MAX as i64) as u32;
                 let ledgers_to_extend_by = extend_to_ledger.saturating_sub(entry.live_until_ledger);
 
                 Some(ExtendTtlSuggestion {
@@ -2557,7 +2559,7 @@ impl SimulationEngine {
             resources,
             transaction_hash: None,
             latest_ledger: rpc_result.latest_ledger,
-            cost_stroops: cost_stroops,
+            cost_stroops,
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: rpc_result.transaction_data,
@@ -2659,8 +2661,13 @@ impl SimulationEngine {
     pub(crate) fn calculate_cost(&self, resources: &SorobanResources) -> u64 {
         let cpu_cost = resources.cpu_instructions / 10000;
         let ram_cost = resources.ram_bytes / 1024;
-        let ledger_cost = (resources.ledger_read_bytes + resources.ledger_write_bytes) / 1024;
-        cpu_cost + ram_cost + ledger_cost
+        let ledger_bytes = resources
+            .ledger_read_bytes
+            .saturating_add(resources.ledger_write_bytes);
+        let ledger_cost = ledger_bytes / 1024;
+        cpu_cost
+            .saturating_add(ram_cost)
+            .saturating_add(ledger_cost)
     }
 
     /// Create invoke transaction for contract call
@@ -2793,8 +2800,8 @@ impl SimulationEngine {
         function_name: &str,
         args: Vec<String>,
         overrides: HashMap<String, String>,
-        protocol_version: Option<u32>,
-        enable_experimental: Option<bool>,
+        _protocol_version: Option<u32>,
+        _enable_experimental: Option<bool>,
     ) -> Result<SimulationResult, SimulationError> {
         tracing::info!(
             "Running local simulation with {} overrides",
@@ -2971,7 +2978,7 @@ impl SimulationEngine {
         network_passphrase: &str,
         expiration_ledger: u32,
     ) -> Result<SorobanAuthorizationEntry, SimulationError> {
-        use ed25519_dalek::{Keypair, PublicKey as DalekPublicKey, SecretKey};
+        use ed25519_dalek::SigningKey;
 
         // 1. Parse the Stellar secret key (S...)
         let strkey = Strkey::from_string(secret)
@@ -2984,15 +2991,8 @@ impl SimulationEngine {
                 ))
             }
         };
-        let secret_key = SecretKey::from_bytes(&seed)
-            .map_err(|e| SimulationError::NodeError(format!("Invalid secret key bytes: {e}")))?;
-        let public_key = DalekPublicKey::from(&secret_key).to_bytes();
-        let signing_key = Keypair {
-            secret: secret_key,
-            public: DalekPublicKey::from_bytes(&public_key).map_err(|e| {
-                SimulationError::NodeError(format!("Invalid public key bytes: {e}"))
-            })?,
-        };
+        let signing_key = SigningKey::from_bytes(&seed);
+        let public_key = signing_key.verifying_key().to_bytes();
 
         // 2. Derive a deterministic nonce: sha256(pubkey || invocation_xdr)[0..8]
         let invocation_xdr = invocation
@@ -3292,7 +3292,7 @@ pub fn profile_contract_with_flamegraph(
         // Decode: (payload >> 8) gives the raw counter value.
         let count = invoke_result
             .ok()
-            .map(|v| (v.get_payload() >> 8) as u64)
+            .map(|v| v.get_payload() >> 8)
             .unwrap_or(0);
         let mut map: HashMap<String, u64> = HashMap::new();
         map.insert(function_name.clone(), count);
@@ -3313,7 +3313,7 @@ pub fn profile_contract_with_flamegraph(
     let elapsed_ms = start.elapsed().as_millis() as u64;
     tracing::Span::current().record("total_instructions", total_instructions);
     tracing::Span::current().record("elapsed_ms", elapsed_ms);
-    tracing::Span::current().record("granularity", &granularity.as_str());
+    tracing::Span::current().record("granularity", granularity.as_str());
 
     Ok((
         resources,
@@ -3328,9 +3328,6 @@ pub fn profile_contract_with_flamegraph(
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
-const CACHE_TTL_SECS: u64 = 3_600;
-const CACHE_MAX_CAPACITY: u64 = 1_000;
-
 // SimulationCache has been moved to cache.rs
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -3338,6 +3335,7 @@ const CACHE_MAX_CAPACITY: u64 = 1_000;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::SimulationCache;
 
     #[test]
     fn test_soroban_resources_default() {
@@ -3478,6 +3476,9 @@ mod tests {
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: "AAA=".to_string(),
+            call_graph: None,
+            state_snapshot: None,
+            protocol_version: 0,
         };
         let second = SimulationResult {
             latest_ledger: 2000,
@@ -3507,6 +3508,9 @@ mod tests {
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: "AAA=".to_string(),
+            call_graph: None,
+            state_snapshot: None,
+            protocol_version: 0,
         };
         let mut second = first.clone();
         second.resources.cpu_instructions = 101;
@@ -3610,12 +3614,14 @@ mod tests {
                 url: "http://a.test".into(),
                 auth_header: None,
                 auth_value: None,
+                advertise: None,
             },
             crate::rpc_provider::RpcProvider {
                 name: "b".into(),
                 url: "http://b.test".into(),
                 auth_header: None,
                 auth_value: None,
+                advertise: None,
             },
         ]);
         let engine = SimulationEngine::with_registry_and_mode(
@@ -3681,6 +3687,8 @@ mod tests {
                 "hello",
                 vec![],
                 overrides,
+                None,
+                None,
             )
             .await;
 
@@ -3851,6 +3859,9 @@ mod tests {
                 state_dependency: None,
                 ttl_analysis: None,
                 transaction_data: "AAA=".to_string(),
+                call_graph: None,
+                state_snapshot: None,
+                protocol_version: 0,
             }
         }
 
@@ -3891,7 +3902,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_cache_miss_on_empty() {
-            let cache = SimulationCache::new();
+            let db = sled::Config::new().temporary(true).open().unwrap();
+            let cache = SimulationCache::new(&db);
             let result = cache.get("nonexistent_key").await;
             assert!(result.is_none());
             assert_eq!(cache.miss_count(), 1);
@@ -3900,7 +3912,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_cache_hit_after_set() {
-            let cache = SimulationCache::new();
+            let db = sled::Config::new().temporary(true).open().unwrap();
+            let cache = SimulationCache::new(&db);
             let key = "test_key".to_string();
             cache.set(key.clone(), make_result()).await;
             let result = cache.get(&key).await;
@@ -3912,7 +3925,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_cache_aside_pattern() {
-            let cache = SimulationCache::new();
+            let db = sled::Config::new().temporary(true).open().unwrap();
+            let cache = SimulationCache::new(&db);
             let key = SimulationCache::generate_key("CONTRACT_X", "do_thing", &[]);
 
             let first = cache.get(&key).await;
@@ -3928,7 +3942,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_different_keys_stored_independently() {
-            let cache = SimulationCache::new();
+            let db = sled::Config::new().temporary(true).open().unwrap();
+            let cache = SimulationCache::new(&db);
             let k1 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[]);
             let k2 = SimulationCache::generate_key("CONTRACT_B", "fn_x", &[]);
             let mut r1 = make_result();

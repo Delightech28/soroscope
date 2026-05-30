@@ -1,8 +1,19 @@
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    clippy::large_enum_variant,
+    clippy::manual_inspect,
+    clippy::needless_borrows_for_generic_args
+)]
 
 use crate::insights::InsightsEngine;
 use crate::simulation::{SimulationEngine, SimulationResult, SorobanResources};
 use crate::ws::SimulationBus;
+use crate::AppError;
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Json,
+};
 use chrono::{DateTime, Utc};
 use redis::{AsyncCommands, Client as RedisClient};
 use reqwest::Client;
@@ -15,7 +26,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
-use tracing;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -647,14 +657,6 @@ impl JobQueue {
         // Push back to Redis queue after delay (using a simple sleep for now or a delayed set)
         // For a robust implementation, we'd use a sorted set for delayed jobs.
         // For now, let's just push it back to the queue.
-        let mut conn = self
-            .redis
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| {
-                JobError::ProcessingFailed(format!("Failed to get Redis connection: {}", e))
-            })?;
-
         let queue = self.clone();
         let id_str = job.id.0.to_string();
         tokio::spawn(async move {
@@ -933,32 +935,14 @@ impl JobWorker {
                     let config = self.config.clone();
                     let http_client = self.http_client.clone();
                     let bus = self.bus.clone();
+                    let id_str_clone = id_str.clone();
 
                     tokio::spawn(async move {
                         let _permit = permit;
 
-                        let result = Self::process_job(
-                            &queue,
-                            job_id,
-                            engine,
-                            insights,
-                            config,
-                            http_client,
-                        )
-                        .await;
-
-                        // Clean up processing list after completion
-                        let mut conn = match queue.redis.get_multiplexed_async_connection().await {
-                            Ok(c) => c,
-                            Err(_) => return,
-                        };
-                        let _: Result<(), _> = conn
-                            .lrem("soroscope:jobs:processing", 1, id_str_clone)
-                            .await;
-
                         if let Err(e) = Self::process_job(
                             &queue,
-                            job,
+                            job_id,
                             engine,
                             insights,
                             config,
@@ -969,6 +953,15 @@ impl JobWorker {
                         {
                             tracing::error!("Job processing error: {}", e);
                         }
+
+                        // Clean up processing list after completion
+                        let mut conn = match queue.redis.get_multiplexed_async_connection().await {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        };
+                        let _: Result<(), _> = conn
+                            .lrem("soroscope:jobs:processing", 1, id_str_clone)
+                            .await;
                     });
                 }
                 Ok(None) => {}
