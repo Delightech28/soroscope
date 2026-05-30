@@ -11,6 +11,7 @@ import type { ContractFunction, InvocationResult } from '../lib/sorobantypes';
 import { UploadZone } from '../components/upload-zone';
 import { extractErrorDetails, createUserFriendlyMessage } from '../lib/errorHandling';
 import { ErrorBoundary } from '../components/ErrorBoundary';
+import { apiUrl } from '../lib/api';
 
 export default function Home() {
   const [contractId, setContractId] = useState('CAEZJVJ4N7P7GRUVD5NG5LYYH23AQHJUKQEUHW54LR5PGQX3V7FXD7Q');
@@ -24,7 +25,7 @@ export default function Home() {
     setLoading(true);
     let errorType: string | undefined;
     try {
-      const response = await fetch('http://localhost:8080/analyze', {
+      const response = await fetch(apiUrl('/analyze'),  {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
