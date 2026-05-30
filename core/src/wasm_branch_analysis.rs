@@ -655,8 +655,13 @@ pub fn analyze_wasm_branches(
     };
 
     // ── 2. Baseline simulation ────────────────────────────────────────────────
-    let baseline_resources =
-        profile_contract(wasm_bytes.clone(), function_name.clone(), args.clone(), None, None)?;
+    let baseline_resources = profile_contract(
+        wasm_bytes.clone(),
+        function_name.clone(),
+        args.clone(),
+        None,
+        None,
+    )?;
 
     // ── 3. Multi-path dynamic exploration ────────────────────────────────────
     let variations = generate_arg_variations(&args);

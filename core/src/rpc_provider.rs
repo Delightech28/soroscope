@@ -54,8 +54,7 @@ impl ProviderStats {
         let previous = self.ema_rtt_us.load(Ordering::Relaxed);
         let alpha_num = 2u128;
         let alpha_den = (self.window + 1) as u128;
-        let next = ((rtt_us as u128 * alpha_num)
-            + (previous as u128 * (alpha_den - alpha_num)))
+        let next = ((rtt_us as u128 * alpha_num) + (previous as u128 * (alpha_den - alpha_num)))
             / alpha_den;
         self.ema_rtt_us.store(next as u64, Ordering::Relaxed);
     }
@@ -360,12 +359,16 @@ impl ProviderRegistry {
         states
             .values()
             .filter_map(|state| {
-                state.provider.try_read().ok().map(|provider| ProviderStatsSnapshot {
-                    name: provider.name.clone(),
-                    url: provider.url.clone(),
-                    ema_rtt_us: state.stats.ema_rtt_us(),
-                    sample_count: state.stats.sample_count(),
-                })
+                state
+                    .provider
+                    .try_read()
+                    .ok()
+                    .map(|provider| ProviderStatsSnapshot {
+                        name: provider.name.clone(),
+                        url: provider.url.clone(),
+                        ema_rtt_us: state.stats.ema_rtt_us(),
+                        sample_count: state.stats.sample_count(),
+                    })
             })
             .collect()
     }

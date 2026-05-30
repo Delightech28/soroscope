@@ -120,7 +120,14 @@ pub async fn run_comparison(
                     None,
                     None,
                 ),
-                engine.simulate_from_contract_id(&contract_id, &function_name, args, None, None, None)
+                engine.simulate_from_contract_id(
+                    &contract_id,
+                    &function_name,
+                    args,
+                    None,
+                    None,
+                    None
+                )
             );
 
             (current_result?.resources, base_result?.resources)
