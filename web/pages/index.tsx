@@ -19,6 +19,8 @@ import { ResultViewerSkeleton } from '../components/ResultViewerSkeleton';
 import { NutritionLabelSkeleton } from '../components/NutritionLabelSkeleton';
 import { ApiError, analyzeService } from '../lib/api';
 import { ResourceHeatmap } from '../components/ResourceHeatmap';
+import { GasGolfingSuggestionsTable } from '../components/GasGolfingSuggestionsTable';
+import type { GasGolfingSuggestion } from '../lib/gasGolfingSort';
 
 export default function Home() {
   const [contractId, setContractId] = useState('CAEZJVJ4N7P7GRUVD5NG5LYYH23AQHJUKQEUHW54LR5PGQX3V7FXD7Q');
@@ -29,6 +31,20 @@ export default function Home() {
   const { history, addToHistory } = useInvocationHistory();
   const [wasmFile, setWasmFile] = useState<File | null>(null);
   const [wasmData, setWasmData] = useState<string | null>(null);
+  const [gasGolfingSuggestions, setGasGolfingSuggestions] = useState<GasGolfingSuggestion[]>([]);
+  const [gasGolfingLoading, setGasGolfingLoading] = useState(false);
+  const [gasGolfingError, setGasGolfingError] = useState<string | null>(null);
+
+  function arrayBufferToBase64(buffer: ArrayBuffer): string {
+    const bytes = new Uint8Array(buffer);
+    const chunkSize = 0x8000;
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.subarray(i, i + chunkSize);
+      binary += String.fromCharCode(...chunk);
+    }
+    return btoa(binary);
+  }
 
   const handleSimulate = async (inputs: Record<string, any>, customWasmData?: string) => {
     setLoading(true);
@@ -167,6 +183,41 @@ export default function Home() {
         <link rel="icon" href="/favicon.ico" />
       </Head>
       <div style={{ minHeight: '100vh', backgroundColor: '#0f1117' }}>
+  const handleWasmReady = async (file: File) => {
+    setGasGolfingLoading(true);
+    setGasGolfingError(null);
+    setGasGolfingSuggestions([]);
+
+    try {
+      const bytes = await file.arrayBuffer();
+      const wasmBytes = arrayBufferToBase64(bytes);
+      const res = await fetch('http://localhost:8080/analyze/gas-golfing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          wasm_bytes: wasmBytes,
+          contract_name: file.name.replace(/\\.wasm$/i, ''),
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await extractErrorDetails(res);
+        throw new Error(createUserFriendlyMessage(err));
+      }
+
+      const data = await res.json();
+      setGasGolfingSuggestions(
+        (data?.report?.suggestions ?? []) as GasGolfingSuggestion[],
+      );
+    } catch (e) {
+      setGasGolfingError(e instanceof Error ? e.message : 'Failed to analyze WASM');
+    } finally {
+      setGasGolfingLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ minHeight: '100vh', backgroundColor: '#0f1117' }}>
       {/* Header */}
       <header className="sticky top-0 z-[100] flex flex-col gap-4 border-b border-[#30363d] bg-[#1a1f26] px-6 py-6 sm:flex-row sm:items-center sm:justify-between sm:px-10 lg:pl-[140px] lg:pr-[125px]">
         <div className="max-w-[1200px]">
@@ -256,9 +307,28 @@ export default function Home() {
                 console.log('[UploadZone] Contract validated and ready for analysis:', file.name, file.size, 'bytes');
                 // File has been validated by backend and is ready for resource analysis
                 // You can now use this file for further processing or analysis
+            <UploadZone
+              onFileReady={(file) => {
+                console.log('[UploadZone] Contract ready for analysis:', file.name, file.size, 'bytes');
+                void handleFileAnalysis(file);
+                void handleWasmReady(file);
               }}
             />
           </ErrorBoundary>
+        </div>
+
+        <div style={{ marginBottom: '24px' }}>
+          {gasGolfingLoading ? (
+            <div className="rounded-lg border border-[#30363d] bg-[#0d1117] p-4 text-sm text-[#8b949e]">
+              Analyzing WASM for Gas Golfing suggestions…
+            </div>
+          ) : gasGolfingError ? (
+            <div className="rounded-lg border border-[#fb8500] bg-[#0d1117] p-4 text-sm text-[#f0883e]">
+              {gasGolfingError}
+            </div>
+          ) : gasGolfingSuggestions.length ? (
+            <GasGolfingSuggestionsTable suggestions={gasGolfingSuggestions} />
+          ) : null}
         </div>
 
         {/* Contract ID Input */}
