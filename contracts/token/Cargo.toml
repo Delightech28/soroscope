@@ -6,10 +6,10 @@ edition = "2021"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-emergency_guard = { path = "../emergency_guard" }
+emergency_guard = { path = "../emergency_guard", default-features = false }
 soroban-sdk = "22.0.0"
 emergency_guard = { path = "../emergency_guard" }
 # Emergency guard provides standardized pause and admin management capabilities
@@ -17,4 +17,4 @@ emergency_guard = { path = "../emergency_guard" }
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
-emergency_guard = { path = "../emergency_guard" }
+emergency_guard = { path = "../emergency_guard", default-features = false }

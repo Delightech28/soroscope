@@ -175,6 +175,9 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
 }
 
 export function UploadZone({ onFileReady, onReset }: UploadZoneProps) {
+}
+
+export function UploadZone({ onFileReady }: UploadZoneProps) {
   const [uploadState, setUploadState] = useState<UploadState>('idle');
   const [droppedFile, setDroppedFile] = useState<DroppedFile | null>(null);
   const [errorMessage, setErrorMessage] = useState<string>('');

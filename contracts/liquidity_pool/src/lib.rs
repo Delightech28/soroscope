@@ -317,6 +317,7 @@ fn load_pool(e: &Env) -> Result<PoolState, Error> {
 fn save_pool(e: &Env, pool: &PoolState) {
     e.storage().instance().set(&DataKey::Pool, pool);
 }
+// ── Constants ─────────────────────────────────────────────────────────────────
 
 pub const MAX_FEE_BPS: i128 = 100;
 pub const DEFAULT_BASE_FEE_BPS: i128 = 30;
@@ -329,6 +330,8 @@ pub const HIGH_VOLATILITY_THRESHOLD_BPS: i128 = 500;
 pub const LOW_VOLATILITY_FEE_BPS: i128 = 40;
 pub const MEDIUM_VOLATILITY_FEE_BPS: i128 = 70;
 pub const HIGH_VOLATILITY_FEE_BPS: i128 = 100;
+
+// ── Oracle trait ──────────────────────────────────────────────────────────────
 
 #[soroban_sdk::contractclient(name = "PriceOracleClient")]
 pub trait PriceOracle {
@@ -362,6 +365,8 @@ fn sqrt(x: i128) -> i128 {
     LastVolatilityBps,
     PendingFeeUpdate,
 }
+// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Private helpers ───────────────────────────────────────────────────────────
 
 fn sqrt(x: i128) -> i128 {
     if x == 0 {
@@ -686,6 +691,7 @@ impl LiquidityPool {
                 fee_bps: DEFAULT_BASE_FEE_BPS,
                 base_fee_bps: DEFAULT_BASE_FEE_BPS,
                 admin: admin.clone(),
+                paused: false,
             },
         );
 

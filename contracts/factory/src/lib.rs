@@ -8,6 +8,8 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec,
 use emergency_guard::{EmergencyGuard, GuardError};
 use soroban_sdk::{
+use emergency_guard::{EmergencyGuard, PauseType};
+use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, IntoVal,
 };
 #[cfg(not(test))]
@@ -37,11 +39,7 @@ fn ensure_not_paused(e: &Env, operation: u32) {
     }
 }
 
-/// Storage key for pair registry.
-/// Stored in **instance** storage because the factory is a singleton contract
-/// and pair mappings are global state that should share the contract's TTL.
-/// Using instance storage avoids per-entry persistent rent and reduces the
-/// ledger footprint to a single entry per invocation.
+/// Storage keys for the factory contract.
 #[contracttype]
 pub enum DataKey {
     Pair(Address, Address),
@@ -73,6 +71,7 @@ fn check_not_paused(env: &Env, operation: u32) -> Result<(), Error> {
     } else {
         Ok(())
     }
+    Admin,
 }
 
 #[contracterror]
@@ -85,6 +84,8 @@ pub enum Error {
     Paused = 4,
     PairAlreadyExists = 5,
     InvalidThreshold = 6,
+    Unauthorized = 2,
+    Paused = 3,
 }
 
 #[contract]
@@ -172,6 +173,21 @@ impl LiquidityPoolFactory {
         })
     }
 
+    /// Initializes the factory contract with an admin and setup the emergency guard.
+    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+
+        // Initialize emergency guard with the admin
+        let admins = soroban_sdk::vec![&env, admin];
+        EmergencyGuard::initialize(env.clone(), admins, 1)
+            .map_err(|_| Error::Unauthorized)?;
+
+        Ok(())
+    }
+
     /// Deploys a new Liquidity Pool contract for a unique pair of tokens.
     pub fn create_pair(
         env: Env,
@@ -187,6 +203,10 @@ impl LiquidityPoolFactory {
 
         // Ensure not paused for mint operation
         ensure_not_paused(&env, PauseType::MINT);
+        if EmergencyGuard::is_paused(env.clone(), PauseType::CREATE_PAIR) {
+            panic!("Pair creation is paused");
+        }
+
         let (token_0, token_1) = if token_a < token_b {
             (token_a, token_b)
         } else {
@@ -268,6 +288,8 @@ impl LiquidityPoolFactory {
 
     /// Admin-only: pause or unpause a factory operation.
     pub fn set_guard_pause(
+    /// Admin-only: pause or unpause a specific operation.
+    pub fn set_operation_paused(
         env: Env,
         admin: Address,
         operation: u32,
@@ -327,6 +349,19 @@ impl LiquidityPoolFactory {
     /// Read the factory's current pause state.
     pub fn get_pause_state(env: Env) -> u32 {
         EmergencyGuard::get_pause_state(env)
+    ) -> Result<(), Error> {
+        EmergencyGuard::set_pause(env, admin, operation, paused)
+            .map_err(|_| Error::Unauthorized)
+    }
+
+    /// Check if a specific operation is paused.
+    pub fn is_paused(env: Env, operation: u32) -> bool {
+        EmergencyGuard::is_paused(env, operation)
+    }
+
+    /// Returns the list of factory admins.
+    pub fn get_admins(env: Env) -> soroban_sdk::Vec<Address> {
+        EmergencyGuard::get_admins(env)
     }
 }
 
