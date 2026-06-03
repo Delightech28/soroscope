@@ -8,6 +8,7 @@ use soroban_sdk::{
     vec, Address, BytesN, Env, String as SorobanString, TryIntoVal,
 };
 use std::vec::Vec;
+use soroban_sdk::{testutils::Address as _, vec, Address, BytesN, Env};
 
 fn dummy_pool_hash(env: &Env) -> BytesN<32> {
     BytesN::from_array(env, &[0; 32])
@@ -35,6 +36,59 @@ fn test_initialization() {
 }
 
 #[test]
+fn test_guard_admin_initialization() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory_id = env.register(LiquidityPoolFactory, ());
+    let factory_client = LiquidityPoolFactoryClient::new(&env, &factory_id);
+
+    let admin1 = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let admins = vec![&env, admin1.clone(), admin2.clone()];
+
+    assert_eq!(factory_client.initialize(&admins, &2), Ok(()));
+    assert_eq!(factory_client.get_threshold(), 2);
+    assert_eq!(factory_client.get_admins().len(), 2);
+    assert!(factory_client.is_admin(&admin1));
+    assert!(factory_client.is_admin(&admin2));
+}
+
+#[test]
+fn test_guard_admin_threshold_checks() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory_id = env.register(LiquidityPoolFactory, ());
+    let factory_client = LiquidityPoolFactoryClient::new(&env, &factory_id);
+
+    let admin1 = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let admins = vec![&env, admin1.clone(), admin2.clone()];
+
+    assert_eq!(factory_client.initialize(&admins, &2), Ok(()));
+
+    let single_approver = vec![&env, admin1.clone()];
+    assert_eq!(
+        factory_client.add_admin(&single_approver, &new_admin),
+        Err(GuardError::InsufficientSignatures)
+    );
+
+    let full_approvals = vec![&env, admin1.clone(), admin2.clone()];
+    assert_eq!(factory_client.add_admin(&full_approvals, &new_admin), Ok(()));
+    assert!(factory_client.is_admin(&new_admin));
+
+    assert_eq!(
+        factory_client.remove_admin(&single_approver, &new_admin),
+        Err(GuardError::InsufficientSignatures)
+    );
+
+    assert_eq!(factory_client.remove_admin(&full_approvals, &new_admin), Ok(()));
+    assert!(!factory_client.is_admin(&new_admin));
+}
+
+#[test]
 fn test_guard_pause_create_pair_success() {
     let env = Env::default();
     env.mock_all_auths();
@@ -42,15 +96,20 @@ fn test_guard_pause_create_pair_success() {
     let factory_id = env.register(LiquidityPoolFactory, ());
     let factory_client = LiquidityPoolFactoryClient::new(&env, &factory_id);
     let admin = Address::generate(&env);
+    let admins = vec![&env, admin.clone()];
 
-    factory_client.initialize(&admin);
-    assert!(!factory_client.guard_is_paused(&emergency_guard::PauseType::CREATE_PAIR));
+    assert_eq!(factory_client.initialize(&admins, &1), Ok(()));
+    assert!(!factory_client.guard_is_paused(&CREATE_PAIR));
 
-    factory_client.guard_pause(&admin, &emergency_guard::PauseType::CREATE_PAIR, &true);
-    assert!(factory_client.guard_is_paused(&emergency_guard::PauseType::CREATE_PAIR));
+    factory_client
+        .guard_pause(&admin, &CREATE_PAIR, &true)
+        .expect("admin should be able to pause create_pair");
+    assert!(factory_client.guard_is_paused(&CREATE_PAIR));
 
-    factory_client.guard_pause(&admin, &emergency_guard::PauseType::CREATE_PAIR, &false);
-    assert!(!factory_client.guard_is_paused(&emergency_guard::PauseType::CREATE_PAIR));
+    factory_client
+        .guard_pause(&admin, &CREATE_PAIR, &false)
+        .expect("admin should be able to resume create_pair");
+    assert!(!factory_client.guard_is_paused(&CREATE_PAIR));
 }
 
 #[test]
@@ -62,10 +121,12 @@ fn test_guard_pause_create_pair_unauthorized() {
     let factory_client = LiquidityPoolFactoryClient::new(&env, &factory_id);
     let admin = Address::generate(&env);
     let stranger = Address::generate(&env);
+    let admins = vec![&env, admin.clone()];
 
-    factory_client.initialize(&admin);
+    assert_eq!(factory_client.initialize(&admins, &1), Ok(()));
+
     assert_eq!(
-        factory_client.try_guard_pause(&stranger, &emergency_guard::PauseType::CREATE_PAIR, &true),
+        factory_client.try_guard_pause(&stranger, &CREATE_PAIR, &true),
         Err(Ok(Error::Unauthorized))
     );
 }

@@ -3,6 +3,9 @@
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, IntoVal, Vec,
+use emergency_guard::{EmergencyGuard, GuardError};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec,
 };
 #[cfg(not(test))]
 use soroban_sdk::xdr::ToXdr;
@@ -29,7 +32,6 @@ pub enum Error {
 #[contracttype]
 pub enum DataKey {
     Pair(Address, Address),
-    Admin,
     GuardPauseState,
 }
 
@@ -65,16 +67,42 @@ pub struct LiquidityPoolFactory;
 
 #[contractimpl]
 impl LiquidityPoolFactory {
-    /// Initializes the factory guard admin. Pair creation remains unpaused by default.
-    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
-        if env.storage().instance().has(&DataKey::Admin) {
-            return Err(Error::AlreadyInitialized);
-        }
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::GuardPauseState, &0u32);
-        Ok(())
+    /// Initializes the factory admin committee using the shared EmergencyGuard storage.
+    pub fn initialize(env: Env, admins: Vec<Address>, threshold: u32) -> Result<(), GuardError> {
+        EmergencyGuard::initialize(env, admins, threshold)
+    }
+
+    /// Add a new admin using the shared multi-signature approval flow.
+    pub fn add_admin(
+        env: Env,
+        approvers: Vec<Address>,
+        new_admin: Address,
+    ) -> Result<(), GuardError> {
+        EmergencyGuard::add_admin(env, approvers, new_admin)
+    }
+
+    /// Remove an admin using the shared multi-signature approval flow.
+    pub fn remove_admin(
+        env: Env,
+        approvers: Vec<Address>,
+        admin: Address,
+    ) -> Result<(), GuardError> {
+        EmergencyGuard::remove_admin(env, approvers, admin)
+    }
+
+    /// Returns the currently configured factory admins.
+    pub fn get_admins(env: Env) -> Vec<Address> {
+        EmergencyGuard::get_admins(env)
+    }
+
+    /// Returns the required multi-signature threshold.
+    pub fn get_threshold(env: Env) -> u32 {
+        EmergencyGuard::get_threshold(env)
+    }
+
+    /// Checks whether an address is currently authorized as a factory admin.
+    pub fn is_admin(env: Env, addr: Address) -> bool {
+        EmergencyGuard::is_admin(&env, &addr)
     }
 
     /// Pause or resume a granular factory operation.
@@ -85,14 +113,11 @@ impl LiquidityPoolFactory {
         paused: bool,
     ) -> Result<(), Error> {
         admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if stored_admin != admin {
+
+        if !EmergencyGuard::is_admin(&env, &admin) {
             return Err(Error::Unauthorized);
         }
+
         set_pause_state(&env, operation, paused);
         Ok(())
     }
