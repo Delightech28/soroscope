@@ -49,6 +49,10 @@ impl PauseType {
     pub fn unpause_all(&mut self) {
         self.0 = 0;
     }
+
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
 }
 
 /// Data keys for emergency guard storage
@@ -320,6 +324,16 @@ impl EmergencyGuard {
         emit_guard_initialized(&env, &admins, threshold);
 
         Ok(())
+    }
+
+    /// Returns the raw pause-state bitmask.
+    pub fn get_pause_state(env: Env) -> u32 {
+        let pause_state: PauseType = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseState)
+            .unwrap_or(PauseType::new(0));
+        pause_state.as_u32()
     }
 
     /// Check if an operation is paused

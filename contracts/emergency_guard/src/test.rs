@@ -526,6 +526,16 @@ fn test_guard_events() {
         .expect("missing admin remove event");
     let remove_data: AdminRemovedEvent = remove_event.2.try_into_val(&env).unwrap();
     assert_eq!(remove_data.admin, admin3);
+#[test]
+fn test_pause_type_as_u32_bitmask() {
+    let mut pause = crate::PauseType::new(0);
+    pause.set_paused(crate::PauseType::SWAP, true);
+    pause.set_paused(crate::PauseType::DEPOSIT, true);
+    assert_eq!(
+        pause.as_u32(),
+        crate::PauseType::SWAP | crate::PauseType::DEPOSIT
+    );
+}
 
 #[test]
 fn test_event_emission_for_guard_actions() {

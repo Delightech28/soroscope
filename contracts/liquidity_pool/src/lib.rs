@@ -12,8 +12,10 @@ use emergency_guard::{
     emit_pause_state_changed, emit_resumed_all, EmergencyGuardTrait, GuardError, PauseType,
 };
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
+use emergency_guard::{EmergencyGuard, GuardError, PauseType};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, vec, Address, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, vec, Address, Env,
+    String, Vec,
 };
 
 #[cfg(test)]
@@ -21,6 +23,11 @@ mod fuzz_test;
 #[cfg(test)]
 mod test;
 
+// ── Errors ────────────────────────────────────────────────────────────────────
+
+/// Errors returned by the `LiquidityPool` contract.
+///
+/// Code assignments are stable on-chain ABI — do NOT renumber.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -163,11 +170,14 @@ pub mod pause_op {
     pub const BURN: u32 = 1 << 5;
     pub const ALL: u32 = u32::MAX;
 }
+// ── Oracle interface ──────────────────────────────────────────────────────────
 
 #[soroban_sdk::contractclient(name = "PriceOracleClient")]
 pub trait PriceOracle {
     fn latest_price(e: Env) -> i128;
 }
+
+// ── On-chain data types ───────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,7 +244,6 @@ pub struct OracleConfig {
     pub oracle_id: Address,
     pub base_fee_bps: i128,
     pub timelock_ledgers: u32,
-    pub based_on_volatility_bps: i128,
 }
 
 #[derive(Clone)]
@@ -413,6 +422,26 @@ fn load_or_init_guard_from_pool(e: &Env, pool: &PoolState) -> GuardState {
 fn check_paused(pool: &PoolState, operation: u32, guard: &GuardState) -> Result<(), Error> {
     if guard.pause_state & operation != 0 {
 fn check_not_paused(e: &Env, operation: u32) -> Result<(), Error> {
+fn load_admin(e: &Env) -> Result<Address, Error> {
+    e.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotInitialized)
+}
+
+fn map_guard_err(err: GuardError) -> Error {
+    match err {
+        GuardError::Paused => Error::Paused,
+        GuardError::NotInitialized => Error::NotInitialized,
+        GuardError::Unauthorized
+        | GuardError::InsufficientSignatures
+        | GuardError::AdminNotFound
+        | GuardError::InvalidThreshold => Error::Unauthorized,
+        GuardError::AlreadyInitialized => Error::AlreadyInitialized,
+    }
+}
+
+fn require_not_paused(e: &Env, operation: u32) -> Result<(), Error> {
     if EmergencyGuard::is_paused(e.clone(), operation) {
         Err(Error::Paused)
     } else {
@@ -561,6 +590,12 @@ fn guard_set_ops(e: &Env, ops: u32, paused: bool) {
         .instance()
         .set(&DataKey::GuardPauseState, &state);
 }
+const CORE_PAUSE_OPS: [u32; 4] = [
+    PauseType::SWAP,
+    PauseType::DEPOSIT,
+    PauseType::WITHDRAW,
+    PauseType::BURN,
+];
 
 fn primary_admin(e: &Env) -> Result<Address, GuardError> {
     let guard = load_guard(e);
@@ -627,6 +662,8 @@ pub struct LiquidityPool;
 
 #[contractimpl]
 impl LiquidityPool {
+    // ── Initialisation ────────────────────────────────────────────────────────
+
     pub fn initialize(
         e: Env,
         admin: Address,
@@ -676,22 +713,171 @@ impl LiquidityPool {
             .unwrap_or(DEFAULT_BASE_FEE_BPS)
     }
 
+            },
+        );
+
+        EmergencyGuard::initialize(e.clone(), vec![&e, admin], 1).map_err(map_guard_err)?;
+        Ok(())
+    }
+
+    // ── Admin accessors ─────────────────────────────────────────────────────────
+
+    pub fn get_admin(e: Env) -> Address {
+        load_admin(&e).expect("not initialized")
+    }
+
+    pub fn get_admins(e: Env) -> Vec<Address> {
+        EmergencyGuard::get_admins(e)
+    }
+
+    pub fn get_admin_threshold(e: Env) -> u32 {
+        EmergencyGuard::get_threshold(e)
+    }
+
+    // ── EmergencyGuard pause interface ──────────────────────────────────────────
+
+    pub fn guard_pause(
+        e: Env,
+        admin: Address,
+        operation: u32,
+        paused: bool,
+    ) -> Result<(), Error> {
+        EmergencyGuard::set_pause(e, admin, operation, paused).map_err(map_guard_err)
+    }
+
+    pub fn guard_is_paused(e: Env, operation: u32) -> bool {
+        EmergencyGuard::is_paused(e, operation)
+    }
+
+    pub fn set_operation_paused(
+        e: Env,
+        admin: Address,
+        operation: u32,
+        paused: bool,
+    ) -> Result<(), Error> {
+        Self::guard_pause(e, admin, operation, paused)
+    }
+
+    /// Pause or unpause all core pool operations (swap, deposit, withdraw, burn).
+    pub fn set_paused(e: Env, paused: bool) -> Result<(), Error> {
+        let admin = load_admin(&e)?;
+        for op in CORE_PAUSE_OPS {
+            EmergencyGuard::set_pause(e.clone(), admin.clone(), op, paused).map_err(map_guard_err)?;
+        }
+        Ok(())
+    }
+
+    pub fn pause_swaps(e: Env) -> Result<(), Error> {
+        let admin = load_admin(&e)?;
+        EmergencyGuard::set_pause(e, admin, PauseType::SWAP, true).map_err(map_guard_err)
+    }
+
+    pub fn resume_swaps(e: Env) -> Result<(), Error> {
+        let admin = load_admin(&e)?;
+        EmergencyGuard::set_pause(e, admin, PauseType::SWAP, false).map_err(map_guard_err)
+    }
+
+    pub fn pause_deposits(e: Env) -> Result<(), Error> {
+        let admin = load_admin(&e)?;
+        EmergencyGuard::set_pause(e, admin, PauseType::DEPOSIT, true).map_err(map_guard_err)
+    }
+
+    pub fn resume_deposits(e: Env) -> Result<(), Error> {
+        let admin = load_admin(&e)?;
+        EmergencyGuard::set_pause(e, admin, PauseType::DEPOSIT, false).map_err(map_guard_err)
+    }
+
+    pub fn pause_withdrawals(e: Env) -> Result<(), Error> {
+        let admin = load_admin(&e)?;
+        EmergencyGuard::set_pause(e, admin, PauseType::WITHDRAW, true).map_err(map_guard_err)
+    }
+
+    pub fn resume_withdrawals(e: Env) -> Result<(), Error> {
+        let admin = load_admin(&e)?;
+        EmergencyGuard::set_pause(e, admin, PauseType::WITHDRAW, false).map_err(map_guard_err)
+    }
+
+    pub fn emergency_pause(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
+        EmergencyGuard::emergency_pause(e, approvers).map_err(map_guard_err)
+    }
+
+    pub fn resume(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
+        EmergencyGuard::resume(e, approvers).map_err(map_guard_err)
+    }
+
+    pub fn emergency_pause_all(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
+        Self::emergency_pause(e, approvers)
+    }
+
+    pub fn resume_all(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
+        Self::resume(e, approvers)
+    }
+
+    pub fn get_pause_state(e: Env) -> u32 {
+        EmergencyGuard::get_pause_state(e)
+    }
+
+    pub fn is_paused_op(e: Env, operation: u32) -> bool {
+        EmergencyGuard::is_paused(e, operation)
+    }
+
+    pub fn add_admin(e: Env, approvers: Vec<Address>, new_admin: Address) -> Result<(), Error> {
+        EmergencyGuard::add_admin(e, approvers, new_admin).map_err(map_guard_err)
+    }
+
+    pub fn remove_admin(e: Env, approvers: Vec<Address>, admin: Address) -> Result<(), Error> {
+        let pool_admin = load_admin(&e)?;
+        EmergencyGuard::remove_admin(e.clone(), approvers, admin.clone()).map_err(map_guard_err)?;
+        let admins = EmergencyGuard::get_admins(e.clone());
+        if pool_admin == admin && admins.len() == 1 {
+            if let Some(remaining) = admins.get(0) {
+                e.storage().instance().set(&DataKey::Admin, &remaining);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rotate_admin(
+        e: Env,
+        approvers: Vec<Address>,
+        old_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        let pool_admin = load_admin(&e)?;
+        if pool_admin != old_admin {
+            return Err(Error::Unauthorized);
+        }
+        EmergencyGuard::add_admin(e.clone(), approvers.clone(), new_admin.clone())
+            .map_err(map_guard_err)?;
+        EmergencyGuard::remove_admin(e.clone(), approvers, old_admin).map_err(map_guard_err)?;
+        e.storage().instance().set(&DataKey::Admin, &new_admin);
+        Ok(())
+    }
+
+    // ── Fee management ────────────────────────────────────────────────────────
+
+    pub fn get_fee(e: Env) -> i128 {
+        load_pool(&e)
+            .map(|p| p.fee_bps)
+            .unwrap_or(DEFAULT_BASE_FEE_BPS)
+    }
+
     pub fn set_fee(e: Env, fee_bps: i128) -> Result<(), Error> {
         if !(0..=MAX_FEE_BPS).contains(&fee_bps) {
             return Err(Error::InvalidFee);
         }
 
+        let admin = load_admin(&e)?;
+        admin.require_auth();
         let mut pool = load_pool(&e)?;
-        pool.admin.require_auth();
         let old_fee = pool.fee_bps;
         pool.fee_bps = fee_bps;
-        pool.base_fee_bps = fee_bps;
         save_pool(&e, &pool);
 
         e.events().publish(
-            (String::from_str(&e, "fee_changed"), pool.admin.clone()),
+            (String::from_str(&e, "fee_changed"), admin.clone()),
             FeeChangedEvent {
-                admin: pool.admin,
+                admin,
                 old_fee_bps: old_fee,
                 new_fee_bps: fee_bps,
             },
@@ -1186,6 +1372,8 @@ impl LiquidityPool {
         pool.base_fee_bps = base_fee_bps;
         save_pool(&e, &pool);
 
+        let admin = load_admin(&e)?;
+        admin.require_auth();
         e.storage().instance().set(
             &DataKey::OracleConfig,
             &OracleConfig {
@@ -1195,6 +1383,17 @@ impl LiquidityPool {
             },
         );
         Ok(())
+    }
+
+    pub fn get_last_volatility_bps(e: Env) -> i128 {
+        e.storage()
+            .instance()
+            .get(&DataKey::LastVolatilityBps)
+            .unwrap_or(0)
+    }
+
+    pub fn get_pending_fee_update(e: Env) -> Option<PendingFeeUpdate> {
+        e.storage().instance().get(&DataKey::PendingFeeUpdate)
     }
 
     pub fn sync_fee_from_oracle(e: Env) -> Result<Option<PendingFeeUpdate>, Error> {
@@ -1212,6 +1411,8 @@ impl LiquidityPool {
             .instance()
             .get::<_, i128>(&DataKey::LastOraclePrice)
         else {
+        let maybe_last: Option<i128> = e.storage().instance().get(&DataKey::LastOraclePrice);
+        let Some(last_price) = maybe_last else {
             e.storage()
                 .instance()
                 .set(&DataKey::LastOraclePrice, &current_price);
@@ -1261,6 +1462,9 @@ impl LiquidityPool {
 
         if e.ledger().sequence() < pending.executable_after_ledger {
             return Err(Error::TimelockNotElapsed);
+        }
+        if !(0..=MAX_FEE_BPS).contains(&pending.new_fee_bps) {
+            return Err(Error::InvalidFee);
         }
 
         let mut pool = load_pool(&e)?;
@@ -1691,9 +1895,10 @@ impl LiquidityPool {
             .get(&DataKey::LastVolatilityBps)
             .unwrap_or(0)
     }
+    // ── Core AMM operations ───────────────────────────────────────────────────
 
     pub fn deposit(e: Env, to: Address, amount_a: i128, amount_b: i128) -> Result<i128, Error> {
-        guard_check_not_paused(&e, pause_op::DEPOSIT)?;
+        require_not_paused(&e, PauseType::DEPOSIT)?;
         to.require_auth();
 
         let mut pool = load_pool(&e)?;
@@ -1768,6 +1973,7 @@ impl LiquidityPool {
         let guard = load_or_init_guard_from_pool(&e, &pool);
         check_paused(&pool, PauseType::SWAP, &guard)?;
         guard_check_not_paused(&e, pause_op::SWAP)?;
+        require_not_paused(&e, PauseType::SWAP)?;
         to.require_auth();
 
         let mut pool = load_pool(&e)?;
@@ -1849,6 +2055,7 @@ impl LiquidityPool {
         let guard = load_or_init_guard_from_pool(&e, &pool);
         check_paused(&pool, PauseType::WITHDRAW, &guard)?;
         guard_check_not_paused(&e, pause_op::WITHDRAW)?;
+        require_not_paused(&e, PauseType::WITHDRAW)?;
         to.require_auth();
 
         let mut pool = load_pool(&e)?;
@@ -1924,6 +2131,7 @@ impl LiquidityPool {
         let guard = load_or_init_guard_from_pool(&e, &pool);
         check_paused(&pool, PauseType::BURN, &guard)?;
         guard_check_not_paused(&e, pause_op::BURN)?;
+        require_not_paused(&e, PauseType::BURN)?;
         from.require_auth();
 
         let mut pool = load_pool(&e)?;
@@ -1979,6 +2187,7 @@ impl LiquidityPool {
 
     pub fn transfer(e: Env, from: Address, to: Address, amount: i128) -> Result<(), Error> {
         guard_check_not_paused(&e, pause_op::TRANSFER)?;
+        require_not_paused(&e, PauseType::TRANSFER)?;
         from.require_auth();
 
         let from_key = DataKey::Balance(from.clone());
@@ -2052,6 +2261,7 @@ impl LiquidityPool {
         amount: i128,
     ) -> Result<(), Error> {
         guard_check_not_paused(&e, pause_op::TRANSFER)?;
+        require_not_paused(&e, PauseType::TRANSFER)?;
         spender.require_auth();
 
         let current_allowance = Self::allowance(e.clone(), from.clone(), spender.clone());
