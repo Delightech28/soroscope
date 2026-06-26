@@ -130,6 +130,8 @@ fn emit_guard_event(env: &Env, event: EmergencyGuardEvent) {
         ),
         event,
     );
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuardInitializedEvent {
