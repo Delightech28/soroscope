@@ -11,6 +11,7 @@ pub mod contract_registry;
 pub mod cors;
 pub mod engine;
 pub mod errors;
+pub mod failure;
 pub mod fee_analytics;
 pub mod fee_collector;
 pub mod fee_store;

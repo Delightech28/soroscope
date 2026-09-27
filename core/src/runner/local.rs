@@ -116,7 +116,9 @@ impl LocalRunner {
         })
         .await
         .map_err(|e| {
-            SimulationError::ExecutionFailed(format!("blocking task join failed: {e}"))
+            SimulationError::ExecutionFailed(crate::failure::ExecutionFailure::from_diagnostic(format!(
+                "blocking task join failed: {e}"
+            )))
         })??;
 
         Ok(SimulationResult {
