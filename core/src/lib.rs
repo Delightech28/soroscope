@@ -18,6 +18,7 @@ pub mod fee_store;
 pub mod gas_golfing;
 pub mod graphql;
 pub mod grpc;
+pub mod host_import_heat;
 pub mod insights;
 pub mod jobs;
 pub mod leader_lock;
