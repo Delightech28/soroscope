@@ -103,6 +103,40 @@ impl SorobanFeeConfig {
         let denominator = rate_denominator.max(1) as u128;
         kb.saturating_mul(denominator).max(1)
     }
+
+    /// Hand the checked-in snapshot to `soroban-env-host`'s own calculator.
+    ///
+    /// The whole point of routing through the host is that we do not re-derive
+    /// the fee arithmetic. `soroban-sdk`'s own test helper builds this exact
+    /// struct from the same 2024-12-11 pubnet snapshot that
+    /// `core/config/soroban-fees.json` records, so a quote produced here and a
+    /// quote produced by the SDK agree by construction rather than by two
+    /// independent implementations happening to match.
+    ///
+    /// The two rent denominators are returned alongside because
+    /// [`soroban_env_host::InvocationResources::estimate_fees`] takes them
+    /// positionally rather than folding them into the configuration.
+    pub fn host_fee_configuration(&self) -> (soroban_env_host::fees::FeeConfiguration, i64, i64) {
+        let fee_configuration = soroban_env_host::fees::FeeConfiguration {
+            fee_per_instruction_increment: self.fee_per_instruction_increment,
+            fee_per_read_entry: self.fee_per_read_entry,
+            fee_per_write_entry: self.fee_per_write_entry,
+            fee_per_read_1kb: self.fee_per_read_1kb,
+            // The host's own helper comments that this is deliberately an
+            // overestimate of the network fee, to stay conservative as state
+            // grows. We keep the snapshot value rather than recomputing it from
+            // `fee_per_historical_1kb`, so our numbers match the SDK's.
+            fee_per_write_1kb: self.fee_per_write_1kb,
+            fee_per_historical_1kb: self.fee_per_historical_1kb,
+            fee_per_contract_event_1kb: self.fee_per_contract_event_1kb,
+            fee_per_transaction_size_1kb: self.fee_per_transaction_size_1kb,
+        };
+        (
+            fee_configuration,
+            self.persistent_rent_rate_denominator,
+            self.temporary_rent_rate_denominator,
+        )
+    }
 }
 
 /// `ceil(numerator / denominator)` in `u128` space, saturating to `u64::MAX`.
@@ -492,6 +526,211 @@ pub fn quote_simulation(
     ResourceFeeQuote::estimate(&input, split, config)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Total fee quote: resource side + inclusion side (issue #1011)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Whether an inclusion bid could be produced for this quote.
+///
+/// The resource side of a quote is always available — it is arithmetic over
+/// measured resources and a checked-in fee table. The inclusion side depends on
+/// having recent ledger fee samples to predict from, which is a property of the
+/// node Soroscope is pointed at, not of the transaction being simulated. So the
+/// two are reported independently and this says which one is present.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InclusionStatus {
+    /// Bids were predicted from ledger fee samples.
+    Available,
+    /// No samples were available, so no bid could be predicted.
+    Unavailable,
+}
+
+impl Default for InclusionStatus {
+    /// A quote that omits the field is treated as having no bid.
+    ///
+    /// This is the pessimistic reading on purpose: a missing `inclusion` key
+    /// should not be interpreted as "bids were fine and just got lost in
+    /// serialisation", which would let a caller treat an unknown bid as zero.
+    fn default() -> Self {
+        Self::Unavailable
+    }
+}
+
+/// One number for what a transaction costs, separating the three reasons it
+/// costs anything at all.
+///
+/// A Soroban transaction's fee has two halves that fail in opposite directions:
+///
+/// * the **resource fee**, set by the work the contract does, and
+/// * the **inclusion fee** (a.k.a. the bid), set by ledger congestion and how
+///   fast you want to be included.
+///
+/// People routinely bump the wrong one. Raising the bid when the resource fee is
+/// the actual problem costs more and changes nothing about the resource side;
+/// lowering the bid when resources are the problem gets you a cheaper
+/// transaction that is rejected or that spills over into the next ledger's
+/// congestion. This type exists so both halves are visible in one place.
+///
+/// # Field relationships
+///
+/// * `resource_fee` is the total resource fee and **includes** `rent`.
+/// * `rent` is the portion of `resource_fee` that is rent, and includes
+///   `refundable`.
+/// * `refundable` is the portion of `rent` that comes back: rent on temporary
+///   entries, returned when those entries expire at the end of their TTL. Rent
+///   on persistent entries never comes back.
+///
+/// So `refundable <= rent <= resource_fee` always holds, and
+/// [`FeeQuote::non_refundable_resource_fee`] is the part that is gone for good
+/// regardless of what happens to temporary entries.
+///
+/// None of these are estimates *except* that they are estimates of a fee, not a
+/// charge: the network decides the final resource fee when it meters the
+/// transaction for real.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct FeeQuote {
+    /// Total resource fee, rent included. Always present.
+    #[serde(default)]
+    pub resource_fee: u64,
+
+    /// The portion of `resource_fee` that is rent rather than execution.
+    #[serde(default)]
+    pub rent: u64,
+
+    /// The portion of `rent` that is refunded at temporary-entry expiry.
+    #[serde(default)]
+    pub refundable: u64,
+
+    /// Bid for cheap, slow inclusion. `None` when inclusion is unavailable.
+    #[serde(default)]
+    pub inclusion_economy: Option<u64>,
+
+    /// Bid for balanced inclusion. `None` when inclusion is unavailable.
+    #[serde(default)]
+    pub inclusion_standard: Option<u64>,
+
+    /// Bid for fast inclusion. `None` when inclusion is unavailable.
+    #[serde(default)]
+    pub inclusion_priority: Option<u64>,
+
+    /// A **ceiling**, not a charge: `resource_fee` plus the standard bid.
+    ///
+    /// This is what a caller should provision, not what they will be billed.
+    /// Actual cost is bounded by this and is usually lower, because the standard
+    /// bid over-provisions and the bid is only paid for the ledgers the
+    /// transaction is actually included in. `None` when inclusion is
+    /// unavailable, since without a bid there is no ceiling to state.
+    #[serde(default)]
+    pub total_max: Option<u64>,
+
+    /// Whether the inclusion fields above are populated.
+    #[serde(default)]
+    pub inclusion: InclusionStatus,
+}
+
+impl FeeQuote {
+    /// The part of the resource fee that is never refunded.
+    ///
+    /// This is the number that actually leaves the account for good, and it is
+    /// the one that grows when a contract does more work.
+    pub fn non_refundable_resource_fee(&self) -> u64 {
+        self.resource_fee.saturating_sub(self.rent)
+    }
+
+    /// True when the inclusion bids could not be predicted.
+    pub fn inclusion_unavailable(&self) -> bool {
+        self.inclusion == InclusionStatus::Unavailable
+    }
+
+    /// Build a quote from resources the host metered and an optional inclusion
+    /// prediction.
+    ///
+    /// The resource side is computed by `soroban-env-host`'s own
+    /// [`soroban_env_host::InvocationResources::estimate_fees`], which is also
+    /// what `soroban-sdk`'s test helper uses. We do not re-derive that
+    /// arithmetic: the host already splits rent into persistent and temporary
+    /// components, and the temporary component *is* the refundable amount, so
+    /// there is no need to infer a durability split from a footprint the way
+    /// [`ResourceFeeQuote`] has to.
+    pub fn from_host_resources(
+        resources: &soroban_env_host::InvocationResources,
+        config: &SorobanFeeConfig,
+        prediction: Option<&crate::fee_analytics::FeePrediction>,
+    ) -> Self {
+        let (fee_configuration, persistent_denominator, temporary_denominator) =
+            config.host_fee_configuration();
+        let estimate = resources.estimate_fees(
+            &fee_configuration,
+            persistent_denominator,
+            temporary_denominator,
+        );
+
+        // `estimate_fees` works in i64 and saturates; clamp on the way out so a
+        // hostile or buggy number can never surface as a negative fee.
+        let non_negative = |value: i64| -> u64 { u64::try_from(value).unwrap_or(0) };
+
+        let persistent_rent = non_negative(estimate.persistent_entry_rent);
+        let temporary_rent = non_negative(estimate.temporary_entry_rent);
+        let rent = persistent_rent.saturating_add(temporary_rent);
+        let resource_fee = non_negative(estimate.total).max(rent);
+
+        // No prediction means no bid. The resource side above is unaffected,
+        // which is the point: a node with no fee history still tells you
+        // exactly what the contract will cost to execute.
+        let Some(prediction) = prediction else {
+            return Self {
+                resource_fee,
+                rent,
+                refundable: temporary_rent,
+                inclusion_economy: None,
+                inclusion_standard: None,
+                inclusion_priority: None,
+                total_max: None,
+                inclusion: InclusionStatus::Unavailable,
+            };
+        };
+
+        let inclusion_standard = prediction.standard_bid;
+        Self {
+            resource_fee,
+            rent,
+            refundable: temporary_rent,
+            inclusion_economy: Some(prediction.economy_bid),
+            inclusion_standard: Some(inclusion_standard),
+            inclusion_priority: Some(prediction.priority_bid),
+            // The ceiling uses the *standard* bid, matching what a caller
+            // provisioning a transaction would actually set.
+            total_max: Some(resource_fee.saturating_add(inclusion_standard)),
+            inclusion: InclusionStatus::Available,
+        }
+    }
+
+    /// Compose a quote for a measured invocation, predicting inclusion from
+    /// recent ledger fee samples for the configured network.
+    ///
+    /// An empty sample list yields [`InclusionStatus::Unavailable`] with the
+    /// resource side still populated. Note that
+    /// [`crate::fee_analytics::FeeAnalyticsEngine::predict`] returns fixed
+    /// placeholder bids (100/100/150) for an empty sample list rather than
+    /// signalling the absence of data, so we check for that case here instead
+    /// of forwarding it — otherwise every unbacked node would look like it had a
+    /// confident 100-stroop economy bid.
+    pub fn compose(
+        resources: &soroban_env_host::InvocationResources,
+        samples: &[crate::fee_store::LedgerFeeSample],
+        current_ledger: u64,
+        config: &SorobanFeeConfig,
+    ) -> Self {
+        if samples.is_empty() {
+            return Self::from_host_resources(resources, config, None);
+        }
+        let prediction =
+            crate::fee_analytics::FeeAnalyticsEngine::new().predict(samples, current_ledger);
+        Self::from_host_resources(resources, config, Some(&prediction))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,5 +1061,299 @@ mod tests {
         assert_eq!(quote.refund_status, RefundStatus::UnknownDurability);
         assert_eq!(quote.estimated_refund, None);
         assert!(quote.gross_includes_rent);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Total fee quote — acceptance tests (issue #1011)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod total_quote_tests {
+    use super::*;
+    use crate::fee_store::LedgerFeeSample;
+    use chrono::Utc;
+    use soroban_env_host::InvocationResources;
+
+    /// Resource meters held constant across the acceptance fixtures.
+    ///
+    /// Every test below asserts that the two halves of a quote move
+    /// independently, so the resource side must be a fixed input wherever the
+    /// inclusion side is the variable one, and vice versa.
+    fn resources() -> InvocationResources {
+        InvocationResources {
+            instructions: 250_000,
+            mem_bytes: 65_536,
+            read_entries: 4,
+            write_entries: 3,
+            read_bytes: 2_048,
+            write_bytes: 1_024,
+            contract_events_size_bytes: 300,
+            persistent_rent_ledger_bytes: 4_096,
+            persistent_entry_rent_bumps: 2,
+            temporary_rent_ledger_bytes: 8_192,
+            temporary_entry_rent_bumps: 1,
+        }
+    }
+
+    /// A copy of the checked-in pubnet config with exactly one cost parameter
+    /// overridden, so a test can move one parameter and nothing else.
+    fn config_with(field: &str, value: i64) -> SorobanFeeConfig {
+        let mut config = SorobanFeeConfig::checked_in().clone();
+        match field {
+            "fee_per_instruction_increment" => config.fee_per_instruction_increment = value,
+            "fee_per_read_entry" => config.fee_per_read_entry = value,
+            "fee_per_write_entry" => config.fee_per_write_entry = value,
+            "fee_per_read_1kb" => config.fee_per_read_1kb = value,
+            "fee_per_write_1kb" => config.fee_per_write_1kb = value,
+            other => panic!("no such cost parameter: {other}"),
+        }
+        config
+    }
+
+    /// Ledger fee samples at a given `fee_charged` level.
+    fn samples_at(fee_charged: i64, count: usize) -> Vec<LedgerFeeSample> {
+        let collected_at = Utc::now();
+        (0..count)
+            .map(|i| LedgerFeeSample {
+                ledger_sequence: 1_000 + i as i64,
+                collected_at,
+                base_reserve: 5_000_000,
+                base_fee: fee_charged,
+                max_fee: fee_charged * 2,
+                fee_charged,
+                transaction_count: 100,
+                ledger_close_time: collected_at,
+            })
+            .collect()
+    }
+
+    /// The full fixture: real config, real samples, real prediction.
+    fn full_quote() -> FeeQuote {
+        FeeQuote::compose(
+            &resources(),
+            &samples_at(100, 30),
+            1_030,
+            SorobanFeeConfig::checked_in(),
+        )
+    }
+
+    #[test]
+    fn full_quote_reports_both_halves_and_a_ceiling() {
+        let quote = full_quote();
+
+        assert_eq!(quote.inclusion, InclusionStatus::Available);
+        assert!(!quote.inclusion_unavailable());
+
+        // Resource side is arithmetic over fixed meters, so these are exact.
+        // The host splits the total as follows, and the parts sum to it:
+        //   instructions  250_000 / 10_000 x 25          =     625
+        //   entries       (4 read + 3 write) x 6_250     =  43_750
+        //   writes        3 x 10_000                      =  30_000
+        //   read bytes    2_048 / 1_024 x 1_786          =   3_572
+        //   write bytes   1_024 / 1_024 x 12_000          =  12_000
+        //   contract events                                =   2_930
+        //   persistent rent                                =  21_148
+        //   temporary rent                                 =  10_586
+        //                                                     ------
+        //                                                      124_611
+        // Byte-denominated fees are prorated by bytes/1_024 rather than
+        // rounded up per operation, which is why 512 bytes of reads costs 893
+        // and not 1_786.
+        assert_eq!(quote.resource_fee, 124_611);
+        assert_eq!(quote.rent, 31_734);
+        // Refundable is the temporary half only: it comes back when those
+        // entries expire, whereas persistent rent never does.
+        assert_eq!(quote.refundable, 10_586);
+        assert_eq!(quote.non_refundable_resource_fee(), 92_877);
+
+        assert_eq!(quote.inclusion_economy, Some(90));
+        assert_eq!(quote.inclusion_standard, Some(111));
+        assert_eq!(quote.inclusion_priority, Some(111));
+
+        // The documented acceptance criterion: the ceiling is the resource fee
+        // plus the standard bid.
+        assert_eq!(
+            quote.total_max,
+            Some(quote.resource_fee + quote.inclusion_standard.unwrap())
+        );
+        assert_eq!(quote.total_max, Some(124_722));
+
+        // Containment invariants that make the three numbers readable. The
+        // refundable figure is strictly inside the rent figure, and rent is
+        // strictly inside the resource fee, so no component is double-counted.
+        assert!(quote.refundable < quote.rent);
+        assert!(quote.rent < quote.resource_fee);
+    }
+
+    #[test]
+    fn changing_only_the_cost_parameters_moves_the_resource_fee_and_not_the_bid() {
+        let base = full_quote();
+        let samples = samples_at(100, 30);
+
+        let dearer_cpu = FeeQuote::compose(
+            &resources(),
+            &samples,
+            1_030,
+            &config_with("fee_per_instruction_increment", 50),
+        );
+        assert_ne!(
+            dearer_cpu.resource_fee, base.resource_fee,
+            "doubling the instruction rate must move the resource fee"
+        );
+        assert!(
+            dearer_cpu.resource_fee > base.resource_fee,
+            "a higher rate cannot make a resource fee smaller"
+        );
+        assert_eq!(
+            dearer_cpu.inclusion_standard, base.inclusion_standard,
+            "the bid comes from ledger samples, so a cost-parameter change must not move it"
+        );
+        assert_eq!(dearer_cpu.inclusion_economy, base.inclusion_economy);
+        assert_eq!(dearer_cpu.inclusion_priority, base.inclusion_priority);
+
+        // The write rate feeds both execution and rent, so it exercises the
+        // other half of the same property.
+        let dearer_writes = FeeQuote::compose(
+            &resources(),
+            &samples,
+            1_030,
+            &config_with("fee_per_write_1kb", 24_000),
+        );
+        assert_ne!(dearer_writes.resource_fee, base.resource_fee);
+        assert_ne!(dearer_writes.rent, base.rent);
+        assert_eq!(dearer_writes.inclusion_standard, base.inclusion_standard);
+    }
+
+    #[test]
+    fn changing_only_the_ledger_samples_moves_the_bid_and_not_the_resource_fee() {
+        let cheap_ledger = full_quote();
+
+        let congested = FeeQuote::compose(
+            &resources(),
+            &samples_at(5_000, 30),
+            1_030,
+            SorobanFeeConfig::checked_in(),
+        );
+
+        assert_ne!(
+            congested.inclusion_standard, cheap_ledger.inclusion_standard,
+            "a busier ledger must move the bid"
+        );
+        assert!(
+            congested.inclusion_standard.unwrap() > cheap_ledger.inclusion_standard.unwrap(),
+            "a busier ledger cannot lower the bid"
+        );
+
+        // The criterion that matters: congestion is not the contract's fault,
+        // so nothing on the resource side may move.
+        assert_eq!(congested.resource_fee, cheap_ledger.resource_fee);
+        assert_eq!(congested.rent, cheap_ledger.rent);
+        assert_eq!(congested.refundable, cheap_ledger.refundable);
+        assert_eq!(
+            congested.non_refundable_resource_fee(),
+            cheap_ledger.non_refundable_resource_fee()
+        );
+    }
+
+    #[test]
+    fn missing_samples_leave_the_resource_side_intact_and_null_the_bids() {
+        let quote = FeeQuote::compose(&resources(), &[], 1_030, SorobanFeeConfig::checked_in());
+
+        assert_eq!(quote.inclusion, InclusionStatus::Unavailable);
+        assert!(quote.inclusion_unavailable());
+
+        let full = full_quote();
+        assert_eq!(quote.resource_fee, full.resource_fee);
+        assert_eq!(quote.rent, full.rent);
+        assert_eq!(quote.refundable, full.refundable);
+
+        // Bids are absent, not zero: a zero bid would assert the ledger is
+        // free, which is a claim about the network we cannot make.
+        assert_eq!(quote.inclusion_economy, None);
+        assert_eq!(quote.inclusion_standard, None);
+        assert_eq!(quote.inclusion_priority, None);
+        assert_eq!(quote.total_max, None);
+    }
+
+    #[test]
+    fn compose_refuses_the_analytics_placeholder_bid() {
+        // `FeeAnalyticsEngine::predict` answers an empty sample list with fixed
+        // 100/100/150 placeholders and zero confidence. Forwarding those would
+        // make every node without fee history present a confident 100-stroop
+        // economy bid, so `compose` must not ask for a prediction at all.
+        let placeholder = crate::fee_analytics::FeeAnalyticsEngine::new().predict(&[], 1_030);
+        assert_eq!(placeholder.economy_bid, 100);
+        assert_eq!(placeholder.confidence_score, 0.0);
+
+        let composed = FeeQuote::compose(&resources(), &[], 1_030, SorobanFeeConfig::checked_in());
+        assert_eq!(composed.inclusion_standard, None);
+        assert_eq!(composed.inclusion, InclusionStatus::Unavailable);
+    }
+
+    #[test]
+    fn the_config_bridge_matches_the_sdk_snapshot_exactly() {
+        // The reason this type routes through `InvocationResources::estimate_fees`
+        // is that we do not maintain a second implementation of the fee
+        // arithmetic. Assert the bridge hands the host the same values
+        // `soroban-sdk`'s own test helper uses, so divergence surfaces as a
+        // failing number instead of two calculators quietly disagreeing.
+        let (configuration, persistent, temporary) =
+            SorobanFeeConfig::checked_in().host_fee_configuration();
+        assert_eq!(configuration.fee_per_instruction_increment, 25);
+        assert_eq!(configuration.fee_per_read_entry, 6_250);
+        assert_eq!(configuration.fee_per_write_entry, 10_000);
+        assert_eq!(configuration.fee_per_read_1kb, 1_786);
+        assert_eq!(configuration.fee_per_write_1kb, 12_000);
+        assert_eq!(configuration.fee_per_historical_1kb, 16_235);
+        assert_eq!(configuration.fee_per_contract_event_1kb, 10_000);
+        assert_eq!(configuration.fee_per_transaction_size_1kb, 1_624);
+        assert_eq!(persistent, 2_103);
+        assert_eq!(temporary, 4_206);
+    }
+
+    #[test]
+    fn a_read_only_call_reports_zero_rent_but_keeps_its_ceiling() {
+        let read_only = InvocationResources {
+            instructions: 10_000,
+            mem_bytes: 1_024,
+            read_entries: 2,
+            write_entries: 0,
+            read_bytes: 512,
+            write_bytes: 0,
+            contract_events_size_bytes: 0,
+            persistent_rent_ledger_bytes: 0,
+            persistent_entry_rent_bumps: 0,
+            temporary_rent_ledger_bytes: 0,
+            temporary_entry_rent_bumps: 0,
+        };
+        let quote = FeeQuote::compose(
+            &read_only,
+            &samples_at(100, 30),
+            1_030,
+            SorobanFeeConfig::checked_in(),
+        );
+        //   instructions  10_000 / 10_000 x 25   =    25
+        //   entries       2 read x 6_250         = 12_500
+        //   read bytes    512 / 1_024 x 1_786    =    893
+        assert_eq!(quote.resource_fee, 13_418);
+        assert_eq!(quote.rent, 0);
+        assert_eq!(quote.refundable, 0);
+        assert_eq!(quote.non_refundable_resource_fee(), 13_418);
+        // Zero here is a real measurement, not a missing one: nothing was
+        // written, so nothing will ever be refunded. The bid is unaffected.
+        assert_eq!(quote.inclusion, InclusionStatus::Available);
+        assert_eq!(quote.total_max, Some(13_418 + 111));
+    }
+
+    #[test]
+    fn an_absent_inclusion_key_deserialises_as_unavailable() {
+        let quote: FeeQuote =
+            serde_json::from_str(r#"{"resource_fee":100,"rent":10,"refundable":4}"#)
+                .expect("quote");
+        assert_eq!(quote.inclusion, InclusionStatus::Unavailable);
+        assert_eq!(quote.inclusion_standard, None);
+        assert_eq!(quote.total_max, None);
+        assert_eq!(quote.resource_fee, 100);
     }
 }
