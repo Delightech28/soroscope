@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 pub mod auth;
 pub mod benchmarks;
+pub mod branch_coverage;
 pub mod cache;
 pub mod call_trace_parser;
 pub mod comparison;
