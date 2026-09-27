@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-pub mod api_routes;
 pub mod auth;
 pub mod benchmarks;
 pub mod cache;
@@ -24,6 +23,7 @@ pub mod host_import_heat;
 pub mod insights;
 pub mod jobs;
 pub mod leader_lock;
+pub mod logging;
 pub mod merkle_tree;
 pub mod metrics;
 pub mod parser;
@@ -46,7 +46,9 @@ pub mod ws;
 pub mod xdr_decoder;
 
 pub use errors::AppError;
+pub use logging::{build_env_filter, init_logging, structured_logging_middleware, LogFormat};
 pub use metrics::AppMetrics;
+pub use task_queue::{TelemetryEvent, TelemetryEventQueue, TelemetrySubscriber};
 
 #[derive(Clone)]
 pub struct AppState {

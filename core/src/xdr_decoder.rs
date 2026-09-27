@@ -142,12 +142,14 @@ impl XdrTransactionResultDecoder {
 
         match T::from_xdr(&bytes, Limits::none()) {
             Ok(val) => Ok(val),
-            Err(source) => Err(XdrDecodeError::InvalidXdr {
-                kind,
-                offset: None,
-                message: format!("{source}"),
-                source: Some(source),
-            }),
+            Err(source) => {
+                Err(XdrDecodeError::InvalidXdr {
+                    kind,
+                    offset: None,
+                    message: format!("{source}"),
+                    source: Some(source),
+                })
+            }
         }
     }
 
@@ -158,7 +160,7 @@ impl XdrTransactionResultDecoder {
                 XdrDecodeError::InvalidXdr {
                     kind: "transaction result metadata",
                     offset: None,
-                    message: format!("{source}"),
+                    message: source.to_string(),
                     source: Some(source),
                 }
             })?;
@@ -174,7 +176,7 @@ impl XdrTransactionResultDecoder {
                 XdrDecodeError::InvalidXdr {
                     kind: "Soroban transaction metadata",
                     offset: None,
-                    message: format!("{source}"),
+                    message: source.to_string(),
                     source: Some(source),
                 }
             })?;
@@ -188,7 +190,7 @@ impl XdrTransactionResultDecoder {
                 XdrDecodeError::InvalidXdr {
                     kind: "transaction envelope",
                     offset: None,
-                    message: format!("{source}"),
+                    message: source.to_string(),
                     source: Some(source),
                 }
             })?;

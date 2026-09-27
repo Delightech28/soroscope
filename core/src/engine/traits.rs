@@ -23,7 +23,7 @@ pub enum CacheError {
     WriteError(String),
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum ParserError {
     #[error("Parse error: {0}")]
     ParseError(String),

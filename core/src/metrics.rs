@@ -1,20 +1,29 @@
 use prometheus::{HistogramVec, IntCounterVec, Opts, Registry};
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct AppMetrics {
-    pub(crate) registry: Registry,
-    pub(crate) simulation_latency_seconds: HistogramVec,
-    pub(crate) rpc_error_count_total: IntCounterVec,
-    pub(crate) simulation_requests_total: IntCounterVec,
-    pub(crate) resource_utilization_percent: prometheus::GaugeVec,
+    pub registry: Registry,
+    pub simulation_latency_seconds: HistogramVec,
+    pub rpc_error_count_total: IntCounterVec,
+    pub simulation_requests_total: IntCounterVec,
+    pub resource_utilization_percent: prometheus::GaugeVec,
+    /// Host-wide CPU usage percentage (0–100) sampled by the system
+    /// alarm monitor (issue #592). Label keys are static so scrapers
+    /// see a single `local` series.
     pub host_cpu_usage_percent: prometheus::GaugeVec,
+    /// Host-wide memory usage percentage (0–100) sampled by the
+    /// system alarm monitor (issue #592).
     pub host_memory_usage_percent: prometheus::GaugeVec,
+    /// Resident memory size of the SoroScope process itself, in bytes.
     pub process_memory_bytes: prometheus::GaugeVec,
-    pub(crate) indexing_latency_seconds: HistogramVec,
-    pub(crate) events_processed_total: IntCounterVec,
-    pub(crate) indexing_errors_total: IntCounterVec,
-    pub(crate) job_queue_depth: prometheus::GaugeVec,
+    /// Wall-clock time spent per indexing/collection cycle, by stage.
+    pub indexing_latency_seconds: HistogramVec,
+    /// Ledger events successfully processed, by stage.
+    pub events_processed_total: IntCounterVec,
+    /// Indexing cycle failures, by stage.
+    pub indexing_errors_total: IntCounterVec,
+    /// Depth of background job queues, by queue name.
+    pub job_queue_depth: prometheus::GaugeVec,
 }
 
 impl AppMetrics {
