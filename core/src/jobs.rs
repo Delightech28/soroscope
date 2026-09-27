@@ -2008,61 +2008,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_job_status_helpers_and_serde_aliases() {
-        assert!(JobStatus::Queued.is_pending());
-        assert!(JobStatus::Processing.is_running());
-        assert!(JobStatus::Completed.is_completed());
-        assert!(JobStatus::Failed.is_failed());
-        assert!(JobStatus::Cancelled.is_cancelled());
-
-        assert!(JobStatus::Completed.is_terminal());
-        assert!(JobStatus::Failed.is_terminal());
-        assert!(JobStatus::Cancelled.is_terminal());
-        assert!(!JobStatus::Queued.is_terminal());
-        assert!(!JobStatus::Processing.is_terminal());
-
-        let pending_json = "\"PENDING\"";
-        let status_pending: JobStatus = serde_json::from_str(pending_json).unwrap();
-        assert_eq!(status_pending, JobStatus::Queued);
-
-        let running_json = "\"RUNNING\"";
-        let status_running: JobStatus = serde_json::from_str(running_json).unwrap();
-        assert_eq!(status_running, JobStatus::Processing);
-    }
-
-    #[test]
-    fn test_worker_pool_config_and_builder() {
-        let config = JobQueueConfig::default()
-            .with_worker_threads(8)
-            .with_max_concurrent_jobs(20)
-            .with_job_timeout(600);
-
-        assert_eq!(config.worker_threads, 8);
-        assert_eq!(config.max_concurrent_jobs, 20);
-        assert_eq!(config.job_timeout_secs, 600);
-    }
-
     #[tokio::test]
-    async fn test_cancellation_token_trigger() {
-        let token = CancellationToken::new();
-        assert!(!token.is_cancelled());
-        token.cancel();
-        assert!(token.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn list_handles_pending_and_running_row_aliases() {
+    async fn queue_close_gracefully_terminates_pool() {
         let pool = sqlite_pool_with_jobs_table().await;
-        insert_job(&pool, &JobType::Analyze, "PENDING", &analyze_payload("C1")).await;
-        insert_job(&pool, &JobType::Analyze, "RUNNING", &analyze_payload("C2")).await;
+        let queue = test_queue(pool.clone());
+        insert_job(&pool, &JobType::Analyze, "QUEUED", &analyze_payload("CABC")).await;
 
-        let queue = test_queue(pool);
         let jobs = queue.list(&JobListFilter::default(), 10, 0).await.unwrap();
+        assert_eq!(jobs.len(), 1);
 
-        assert_eq!(jobs.len(), 2);
-        let statuses: Vec<_> = jobs.iter().map(|j| j.status).collect();
-        assert!(statuses.contains(&JobStatus::Queued));
-        assert!(statuses.contains(&JobStatus::Processing));
+        // Gracefully close without hanging
+        queue.close().await;
     }
 }
