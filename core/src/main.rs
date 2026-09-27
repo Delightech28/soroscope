@@ -1,4 +1,3 @@
-```rust
 #![allow(dead_code)]
 
 #[cfg(feature = "jemalloc")]
@@ -3221,5 +3220,3 @@ async fn analyze_simulation(
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
 }
-
-```

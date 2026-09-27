@@ -12,10 +12,12 @@ crate-type = ["rlib"]
 [dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 soroban-env-host = { version = "22", features = ["testutils"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 rusqlite = { version = "0.29", features = ["bundled"] }
+async-trait = "0.1"
+regex = "1.10"
 serde_json = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = { version = "2", features = ["serde"] }
@@ -25,6 +27,8 @@ thiserror = "1.0"
 dotenvy = "0.15"
 config = "0.14"
 axum = { version = "0.7", features = ["multipart", "ws"] }
+async-graphql = { version = "7.0", features = ["chrono", "uuid"] }
+async-graphql-axum = "7.0"
 tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

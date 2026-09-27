@@ -27,6 +27,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -94,11 +95,42 @@ impl std::str::FromStr for JobId {
 #[sqlx(rename_all = "SCREAMING_SNAKE_CASE")]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum JobStatus {
+    #[serde(alias = "PENDING", alias = "pending", alias = "queued")]
     Queued,
+    #[serde(alias = "RUNNING", alias = "running", alias = "processing")]
     Processing,
+    #[serde(alias = "COMPLETED", alias = "completed")]
     Completed,
+    #[serde(alias = "FAILED", alias = "failed")]
     Failed,
+    #[serde(alias = "CANCELLED", alias = "cancelled")]
     Cancelled,
+}
+
+impl JobStatus {
+    pub fn is_pending(&self) -> bool {
+        matches!(self, JobStatus::Queued)
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self, JobStatus::Processing)
+    }
+
+    pub fn is_completed(&self) -> bool {
+        matches!(self, JobStatus::Completed)
+    }
+
+    pub fn is_failed(&self) -> bool {
+        matches!(self, JobStatus::Failed)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, JobStatus::Cancelled)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled)
+    }
 }
 
 /// Type of analysis job
@@ -257,6 +289,30 @@ impl Job {
             secret: self.webhook_secret.clone(),
         })
     }
+
+    pub fn is_pending(&self) -> bool {
+        self.status.is_pending()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.status.is_running()
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.status.is_completed()
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.status.is_failed()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.status.is_cancelled()
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.status.is_terminal()
+    }
 }
 
 /// Errors that can occur in job operations
@@ -283,6 +339,7 @@ pub struct JobQueueConfig {
     pub webhook_timeout_secs: u64,
     pub webhook_max_retries: u32,
     pub max_concurrent_jobs: usize,
+    pub worker_threads: usize,
     pub max_job_retries: i32,
     /// Maximum number of retry-scheduling tasks that may be in flight at
     /// once. Retry scheduling is best-effort background work: once this
@@ -301,9 +358,27 @@ impl Default for JobQueueConfig {
             webhook_timeout_secs: 10,
             webhook_max_retries: 3,
             max_concurrent_jobs: 10,
+            worker_threads: 4,
             max_job_retries: 3,
             retry_queue_capacity: 256,
         }
+    }
+}
+
+impl JobQueueConfig {
+    pub fn with_worker_threads(mut self, worker_threads: usize) -> Self {
+        self.worker_threads = worker_threads;
+        self
+    }
+
+    pub fn with_max_concurrent_jobs(mut self, max_concurrent_jobs: usize) -> Self {
+        self.max_concurrent_jobs = max_concurrent_jobs;
+        self
+    }
+
+    pub fn with_job_timeout(mut self, timeout_secs: u64) -> Self {
+        self.job_timeout_secs = timeout_secs;
+        self
     }
 }
 
@@ -360,12 +435,13 @@ impl JobQueue {
         Ok(())
     }
 
-    /// Submit a new job to the queue
-    pub async fn submit(
+    /// Submit a new job to the queue with custom timeout configuration
+    pub async fn submit_with_timeout(
         &self,
         job_type: JobType,
         payload: JobPayload,
         webhook: Option<WebhookConfig>,
+        timeout_secs: Option<u64>,
     ) -> Result<JobId, JobError> {
         let id = JobId::new();
         let payload_json = serde_json::to_value(&payload).map_err(|e| {
@@ -382,6 +458,8 @@ impl JobQueue {
             None => (None, None, None),
         };
 
+        let timeout = timeout_secs.unwrap_or(self.config.job_timeout_secs) as i32;
+
         match &self.pool {
             DbPool::Postgres(pool) => {
                 sqlx::query(
@@ -397,7 +475,7 @@ impl JobQueue {
                 .bind(&webhook_url)
                 .bind(&webhook_headers)
                 .bind(&webhook_secret)
-                .bind(self.config.job_timeout_secs as i32)
+                .bind(timeout)
                 .execute(pool)
                 .await?;
             }
@@ -415,7 +493,7 @@ impl JobQueue {
                 .bind(&webhook_url)
                 .bind(&webhook_headers)
                 .bind(&webhook_secret)
-                .bind(self.config.job_timeout_secs as i32)
+                .bind(timeout)
                 .execute(pool)
                 .await?;
             }
@@ -434,8 +512,18 @@ impl JobQueue {
             .await
             .map_err(|e| JobError::ProcessingFailed(format!("Redis LPUSH failed: {}", e)))?;
 
-        tracing::info!(job_id = %id, "Job submitted to Redis queue");
+        tracing::info!(job_id = %id, timeout_secs = timeout, "Job submitted to Redis queue");
         Ok(id)
+    }
+
+    /// Submit a new job to the queue
+    pub async fn submit(
+        &self,
+        job_type: JobType,
+        payload: JobPayload,
+        webhook: Option<WebhookConfig>,
+    ) -> Result<JobId, JobError> {
+        self.submit_with_timeout(job_type, payload, webhook, None).await
     }
 
     /// Number of jobs currently waiting in the Redis queue. Used for the
@@ -931,8 +1019,8 @@ impl JobQueue {
 
         let status_str: String = row.try_get("status")?;
         let status = match status_str.as_str() {
-            "QUEUED" => JobStatus::Queued,
-            "PROCESSING" => JobStatus::Processing,
+            "QUEUED" | "PENDING" => JobStatus::Queued,
+            "PROCESSING" | "RUNNING" => JobStatus::Processing,
             "COMPLETED" => JobStatus::Completed,
             "FAILED" => JobStatus::Failed,
             "CANCELLED" => JobStatus::Cancelled,
@@ -1013,7 +1101,12 @@ pub async fn submit_job_handler(
 ) -> Result<(StatusCode, Json<SubmitJobResponse>), AppError> {
     let job_id = state
         .job_queue
-        .submit(payload.job_type, payload.payload, payload.webhook)
+        .submit_with_timeout(
+            payload.job_type,
+            payload.payload,
+            payload.webhook,
+            payload.timeout_secs,
+        )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -1091,6 +1184,7 @@ pub struct JobWorker {
     /// Optional pub/sub bus for real-time WebSocket streaming.
     /// When `None` the worker runs in polling-only mode (backwards-compatible).
     bus: Option<Arc<SimulationBus>>,
+    cancellation_tokens: Arc<tokio::sync::RwLock<HashMap<JobId, CancellationToken>>>,
 }
 
 impl JobWorker {
@@ -1107,7 +1201,28 @@ impl JobWorker {
             config,
             http_client: Client::new(),
             bus: None,
+            cancellation_tokens: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn worker_threads(&self) -> usize {
+        self.config.worker_threads
+    }
+
+    pub fn with_worker_threads(mut self, worker_threads: usize) -> Self {
+        self.config.worker_threads = worker_threads;
+        self
+    }
+
+    /// Cancel a running job directly via its active cancellation token
+    pub async fn cancel_job(&self, id: &JobId) -> Result<Job, JobError> {
+        {
+            let tokens = self.cancellation_tokens.read().await;
+            if let Some(token) = tokens.get(id) {
+                token.cancel();
+            }
+        }
+        self.queue.cancel(id).await
     }
 
     /// Attach a [`SimulationBus`] so the worker publishes real-time events.
@@ -1196,6 +1311,12 @@ impl JobWorker {
                         }
                     };
 
+                    let cancel_token = CancellationToken::new();
+                    {
+                        let mut tokens = self.cancellation_tokens.write().await;
+                        tokens.insert(job_id, cancel_token.clone());
+                    }
+
                     let queue = self.queue.clone();
                     let engine = self.engine.clone();
                     let insights = self.insights_engine.clone();
@@ -1203,6 +1324,7 @@ impl JobWorker {
                     let http_client = self.http_client.clone();
                     let bus = self.bus.clone();
                     let id_str_clone = id_str.clone();
+                    let tokens_registry = self.cancellation_tokens.clone();
 
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -1215,10 +1337,16 @@ impl JobWorker {
                             config,
                             http_client,
                             bus,
+                            cancel_token,
                         )
                         .await
                         {
                             tracing::error!("Job processing error: {}", e);
+                        }
+
+                        {
+                            let mut tokens = tokens_registry.write().await;
+                            tokens.remove(&job_id);
                         }
 
                         // Clean up processing list after completion
@@ -1255,6 +1383,7 @@ impl JobWorker {
         config: JobQueueConfig,
         http_client: Client,
         bus: Option<Arc<SimulationBus>>,
+        cancel_token: CancellationToken,
     ) -> Result<(), JobError> {
         let job = queue
             .get(&job_id)
@@ -1268,17 +1397,29 @@ impl JobWorker {
             b.publish(SimulationBus::progress(&job.id, 10, "Processing started"));
         }
 
-        // Process with timeout
+        // Process with timeout and cancellation token
         let timeout = Duration::from_secs(job.timeout_secs as u64);
-        let result = tokio::time::timeout(
-            timeout,
-            Self::execute_job(&job, &engine, &insights_engine, queue, bus.clone()),
-        )
-        .await;
+        let execute_fut = Self::execute_job(&job, &engine, &insights_engine, queue, bus.clone());
+
+        enum RunOutcome {
+            Completed(Result<JobResult, Box<dyn std::error::Error + Send + Sync>>),
+            TimedOut,
+            Cancelled,
+        }
+
+        let outcome = tokio::select! {
+            _ = cancel_token.cancelled() => RunOutcome::Cancelled,
+            res = tokio::time::timeout(timeout, execute_fut) => {
+                match res {
+                    Ok(exec_res) => RunOutcome::Completed(exec_res),
+                    Err(_) => RunOutcome::TimedOut,
+                }
+            }
+        };
 
         // Handle result, emit terminal event, and optionally send webhook
-        match result {
-            Ok(Ok(job_result)) => {
+        match outcome {
+            RunOutcome::Completed(Ok(job_result)) => {
                 queue.complete(&job.id, &job_result).await?;
 
                 // Emit completed event with resource summary
@@ -1312,7 +1453,7 @@ impl JobWorker {
                     .await;
                 }
             }
-            Ok(Err(e)) => {
+            RunOutcome::Completed(Err(e)) => {
                 let error_msg = e.to_string();
                 queue.fail(&job.id, &error_msg, "ProcessingError").await?;
 
@@ -1340,7 +1481,7 @@ impl JobWorker {
                     .await;
                 }
             }
-            Err(_) => {
+            RunOutcome::TimedOut => {
                 let error_msg = format!("Job timed out after {} seconds", job.timeout_secs);
                 queue.fail(&job.id, &error_msg, "Timeout").await?;
 
@@ -1362,6 +1503,14 @@ impl JobWorker {
                         config.webhook_max_retries,
                     )
                     .await;
+                }
+            }
+            RunOutcome::Cancelled => {
+                let error_msg = "Job execution cancelled by request".to_string();
+                queue.cancel(&job.id).await.ok();
+
+                if let Some(b) = &bus {
+                    b.publish(SimulationBus::failed(&job.id, &error_msg, "Cancelled"));
                 }
             }
         }
@@ -1857,5 +2006,63 @@ mod tests {
             result.is_ok(),
             "cleanup task must exit promptly upon shutdown signal"
         );
+    }
+
+    #[test]
+    fn test_job_status_helpers_and_serde_aliases() {
+        assert!(JobStatus::Queued.is_pending());
+        assert!(JobStatus::Processing.is_running());
+        assert!(JobStatus::Completed.is_completed());
+        assert!(JobStatus::Failed.is_failed());
+        assert!(JobStatus::Cancelled.is_cancelled());
+
+        assert!(JobStatus::Completed.is_terminal());
+        assert!(JobStatus::Failed.is_terminal());
+        assert!(JobStatus::Cancelled.is_terminal());
+        assert!(!JobStatus::Queued.is_terminal());
+        assert!(!JobStatus::Processing.is_terminal());
+
+        let pending_json = "\"PENDING\"";
+        let status_pending: JobStatus = serde_json::from_str(pending_json).unwrap();
+        assert_eq!(status_pending, JobStatus::Queued);
+
+        let running_json = "\"RUNNING\"";
+        let status_running: JobStatus = serde_json::from_str(running_json).unwrap();
+        assert_eq!(status_running, JobStatus::Processing);
+    }
+
+    #[test]
+    fn test_worker_pool_config_and_builder() {
+        let config = JobQueueConfig::default()
+            .with_worker_threads(8)
+            .with_max_concurrent_jobs(20)
+            .with_job_timeout(600);
+
+        assert_eq!(config.worker_threads, 8);
+        assert_eq!(config.max_concurrent_jobs, 20);
+        assert_eq!(config.job_timeout_secs, 600);
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_token_trigger() {
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        token.cancel();
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_handles_pending_and_running_row_aliases() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        insert_job(&pool, &JobType::Analyze, "PENDING", &analyze_payload("C1")).await;
+        insert_job(&pool, &JobType::Analyze, "RUNNING", &analyze_payload("C2")).await;
+
+        let queue = test_queue(pool);
+        let jobs = queue.list(&JobListFilter::default(), 10, 0).await.unwrap();
+
+        assert_eq!(jobs.len(), 2);
+        let statuses: Vec<_> = jobs.iter().map(|j| j.status).collect();
+        assert!(statuses.contains(&JobStatus::Queued));
+        assert!(statuses.contains(&JobStatus::Processing));
     }
 }

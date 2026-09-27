@@ -7,6 +7,7 @@ use soroban_sdk::xdr::{Limits, SorobanTransactionData, ReadXdr};
 pub struct SimulationEngine<P, C, R> {
     provider: P,
     cache: C,
+    #[allow(dead_code)]
     parser: R,
 }
 

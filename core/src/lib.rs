@@ -1,5 +1,7 @@
 #![deny(warnings)]
 
+use std::sync::Arc;
+
 pub mod auth;
 pub mod benchmarks;
 pub mod cache;
@@ -19,6 +21,7 @@ pub mod insights;
 pub mod jobs;
 pub mod leader_lock;
 pub mod merkle_tree;
+pub mod metrics;
 pub mod parser;
 pub mod routing;
 pub mod rpc_provider;
@@ -37,6 +40,7 @@ pub mod ws;
 pub mod xdr_decoder;
 
 pub use errors::AppError;
+pub use metrics::AppMetrics;
 
 #[derive(Clone)]
 pub struct AppState {

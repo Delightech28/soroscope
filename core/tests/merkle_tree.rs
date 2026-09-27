@@ -16,5 +16,5 @@ fn test_merkle() {
 
 #[test]
 fn test_empty() {
-    assert_eq!(MerkleTree::new(vec[]), Erp(MerkleError::EmptyTree));
+    assert_eq!(MerkleTree::new(vec![]), Err(MerkleError::EmptyTree));
 }
