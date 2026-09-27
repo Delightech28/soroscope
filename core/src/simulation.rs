@@ -64,8 +64,15 @@ pub enum SimulationError {
 
     /// The contract ran locally but failed during execution (host error,
     /// panic, budget exhaustion, malformed WASM).
-    #[error("Contract execution failed: {0}")]
-    ExecutionFailed(String),
+    ///
+    /// The payload is structured rather than a bare string (issue #1006): a
+    /// CPU limit, a memory limit, a storage failure, an auth rejection and a
+    /// contract trap all used to collapse into the same message, which left
+    /// the author no way to tell whether to raise the instruction limit,
+    /// shrink a `Vec`, fix an authorisation check, or repair a panic. The
+    /// original diagnostic is preserved verbatim inside the payload.
+    #[error("Contract execution failed: {}", .0.describe())]
+    ExecutionFailed(crate::failure::ExecutionFailure),
 
     #[error("Insufficient consensus providers: {0}")]
     InsufficientConsensusProviders(String),
@@ -90,12 +97,15 @@ impl SimulationError {
 /// Map `soroban-env-host` errors onto `SimulationError` so local-runner
 /// failures surface with the same error type as RPC failures.
 ///
-/// All host errors collapse to `ExecutionFailed` — the distinction between
-/// a budget overrun, an XDR decode glitch, and a contract trap is useful
-/// for debugging but carries no retry meaning at the API boundary.
+/// Every host error is *classified* rather than collapsed (issue #1006): the
+/// kind, and any `contracterror` discriminant the diagnostic carries, are
+/// recovered so callers can act on the distinction. The retry meaning is
+/// deliberately unchanged — `is_retriable()` remains false for every kind,
+/// because a contract-level failure is terminal whether it was a budget
+/// overrun or a panic.
 impl From<soroban_env_host::HostError> for SimulationError {
     fn from(e: soroban_env_host::HostError) -> Self {
-        SimulationError::ExecutionFailed(format!("{e:?}"))
+        SimulationError::ExecutionFailed(crate::failure::ExecutionFailure::from_diagnostic(format!("{e:?}")))
     }
 }
 
@@ -3465,6 +3475,46 @@ pub fn profile_contract_with_flamegraph(
 mod tests {
     use super::*;
     use crate::cache::SimulationCache;
+    use crate::failure::{ExecutionFailure, FailureKind};
+
+    // ── Issue #1006: classified failures keep their retry semantics ──────────
+
+    /// The classification is for debugging, not for retry routing. A budget
+    /// overrun is exactly as terminal as a panic, so this pins the invariant
+    /// that `is_retriable()` did not change.
+    #[test]
+    fn classified_execution_failures_are_never_retriable() {
+        for kind in [
+            FailureKind::CpuLimit,
+            FailureKind::MemLimit,
+            FailureKind::Storage,
+            FailureKind::Auth,
+            FailureKind::ContractTrap,
+            FailureKind::Other,
+        ] {
+            let err = SimulationError::ExecutionFailed(ExecutionFailure::from_diagnostic(
+                "HostError: Error(Limits, exceeded)",
+            ));
+            assert_eq!(err.is_retriable(), false, "kind {:?}", kind);
+        }
+    }
+
+    #[test]
+    fn local_unavailable_remains_the_only_retriable_error() {
+        assert!(SimulationError::LocalUnavailable.is_retriable());
+    }
+
+    #[test]
+    fn execution_failed_display_names_the_kind_and_resolved_error() {
+        let failure = ExecutionFailure::from_diagnostic("HostError: Error(Contract, #3)")
+            .at(Some("CBQHNAX3CFZWBUF2J4C6QEBGB2FEHZPXN2O3KILYZQ2X5XNBEHXHDW5TK".into()), Some("transfer".into()));
+        let err = SimulationError::ExecutionFailed(failure);
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("contract_trap"), "got {}", rendered);
+        assert!(rendered.contains("contracterror #3 (Unauthorized)"), "got {}", rendered);
+        assert!(rendered.contains("transfer"), "got {}", rendered);
+    }
 
     #[test]
     fn test_soroban_resources_default() {

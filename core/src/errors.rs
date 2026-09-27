@@ -134,8 +134,11 @@ impl From<SimulationError> for AppError {
             SimulationError::LocalUnavailable => AppError::Internal(
                 "Local WASM execution unavailable and no RPC fallback succeeded".to_string(),
             ),
-            SimulationError::ExecutionFailed(msg) => {
-                AppError::BadRequest(format!("Contract execution failed: {}", msg))
+            // Issue #1006: the failure is classified, so the message names the
+            // kind and, when the trap carried a `contracterror` discriminant,
+            // the resolved variant rather than a bare integer.
+            SimulationError::ExecutionFailed(failure) => {
+                AppError::BadRequest(format!("Contract execution failed: {}", failure.describe()))
             }
             SimulationError::InsufficientConsensusProviders(msg) => {
                 AppError::Internal(format!("Insufficient consensus providers: {}", msg))
