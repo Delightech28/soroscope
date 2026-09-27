@@ -9,14 +9,16 @@ mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
-mod contract_registry;
+pub mod contract_registry;
 mod errors;
+pub mod failure;
 pub mod fee_analytics;
 pub mod fee_collector;
 pub mod fee_store;
 mod gas_golfing;
 mod grpc;
 mod graphql;
+pub mod host_import_heat;
 pub mod insights;
 mod jobs;
 mod leader_lock;
@@ -24,13 +26,14 @@ mod logging;
 mod merkle_tree;
 pub mod metrics;
 mod parser;
+pub mod parsed_module;
 mod routing;
 pub mod rpc_provider;
 mod rpc_throttle;
 mod runner;
 mod simulation;
 mod simulation_service;
-mod sys_alarms;
+pub mod sys_alarms;
 mod task_queue;
 mod trace_propagation;
 mod wasm_branch_analysis;
@@ -38,6 +41,15 @@ mod worker_pool;
 mod webhooks;
 mod webhook_validation;
 mod ws;
+pub mod xdr_decoder;
+
+use tracing_subscriber::EnvFilter;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::compression::CompressionLayer;
+use tower_http::trace::TraceLayer;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use utoipa::{ToSchema, OpenApi};
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::webhook_validation::ValidatedWebhook;
 
@@ -71,13 +83,44 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tower_http::compression::CompressionLayer;
-use tower_http::cors::{Any, CorsLayer};
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
-use tower_http::trace::TraceLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use utoipa::{OpenApi, ToSchema};
-use utoipa_swagger_ui::SwaggerUi;
+use clap::Parser;
+
+/// Command-line argument options for SoroScope Core.
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "soroscope-core",
+    author = "SoroLabs",
+    version = "0.1.0",
+    about = "SoroScope Core CLI & Simulation Server",
+    long_about = "Soroban smart contract execution, simulation, state tracing, and RPC failover engine."
+)]
+pub struct CliArgs {
+    /// Custom Soroban RPC endpoint URL
+    #[arg(
+        short = 'r',
+        long = "rpc-url",
+        default_value = "https://soroban-testnet.stellar.org",
+        help = "Custom Soroban RPC endpoint URL (defaults to Soroban Testnet)"
+    )]
+    pub rpc_url: String,
+
+    /// Stellar network passphrase
+    #[arg(
+        short = 'n',
+        long = "network-passphrase",
+        default_value = "Test SDF Network ; September 2015",
+        help = "Stellar network passphrase (defaults to Testnet passphrase)"
+    )]
+    pub network_passphrase: String,
+
+    /// Enable verbose XDR logging and debug level output
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        help = "Enable verbose XDR logging and debug level output"
+    )]
+    pub verbose: bool,
+}
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -451,7 +494,140 @@ pub struct AppState {
     /// WebSocket event bus for simulation jobs.
     simulation_bus: Arc<SimulationBus>,
 }
-use crate::metrics::AppMetrics;
+
+#[derive(Clone)]
+pub(crate) struct AppMetrics {
+    registry: Registry,
+    simulation_latency_seconds: HistogramVec,
+    rpc_error_count_total: IntCounterVec,
+    simulation_requests_total: IntCounterVec,
+    resource_utilization_percent: prometheus::GaugeVec,
+    /// Host-wide CPU usage percentage (0–100) sampled by the system
+    /// alarm monitor (issue #592). Label keys are static so scrapers
+    /// see a single `local` series.
+    pub(crate) host_cpu_usage_percent: prometheus::GaugeVec,
+    /// Host-wide memory usage percentage (0–100) sampled by the
+    /// system alarm monitor (issue #592).
+    pub(crate) host_memory_usage_percent: prometheus::GaugeVec,
+    /// Resident memory size of the SoroScope process itself, in bytes.
+    pub(crate) process_memory_bytes: prometheus::GaugeVec,
+    /// Wall-clock time spent per indexing/collection cycle, by stage.
+    indexing_latency_seconds: HistogramVec,
+    /// Ledger events successfully processed, by stage.
+    events_processed_total: IntCounterVec,
+    /// Indexing cycle failures, by stage.
+    indexing_errors_total: IntCounterVec,
+    /// Depth of background job queues, by queue name.
+    job_queue_depth: prometheus::GaugeVec,
+}
+
+impl AppMetrics {
+    fn new() -> Result<Self, prometheus::Error> {
+        let registry = Registry::new();
+
+        let simulation_latency_seconds = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "simulation_latency_seconds",
+                "Latency of simulation requests in seconds",
+            ),
+            &["endpoint"],
+        )?;
+        let rpc_error_count_total = IntCounterVec::new(
+            Opts::new(
+                "rpc_error_count_total",
+                "Total number of RPC and simulation errors",
+            ),
+            &["endpoint", "error_type"],
+        )?;
+        let simulation_requests_total = IntCounterVec::new(
+            Opts::new(
+                "simulation_requests_total",
+                "Total number of simulation requests by endpoint and cache status",
+            ),
+            &["endpoint", "cache_status"],
+        )?;
+        let resource_utilization_percent = prometheus::GaugeVec::new(
+            Opts::new(
+                "resource_utilization_percent",
+                "Resource utilization percentage from latest simulation sample",
+            ),
+            &["resource"],
+        )?;
+        let host_cpu_usage_percent = prometheus::GaugeVec::new(
+            Opts::new(
+                "host_cpu_usage_percent",
+                "Host-wide CPU usage percentage (0-100) sampled by the system alarm monitor",
+            ),
+            &["host"],
+        )?;
+        let host_memory_usage_percent = prometheus::GaugeVec::new(
+            Opts::new(
+                "host_memory_usage_percent",
+                "Host-wide memory usage percentage (0-100) sampled by the system alarm monitor",
+            ),
+            &["host"],
+        )?;
+        let process_memory_bytes = prometheus::GaugeVec::new(
+            Opts::new(
+                "process_memory_bytes",
+                "Resident memory size of the SoroScope process in bytes",
+            ),
+            &["process"],
+        )?;
+        let indexing_latency_seconds = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "indexing_latency_seconds",
+                "Latency of ledger indexing/collection cycles in seconds",
+            ),
+            &["stage"],
+        )?;
+        let events_processed_total = IntCounterVec::new(
+            Opts::new(
+                "events_processed_total",
+                "Total number of ledger events successfully processed",
+            ),
+            &["stage"],
+        )?;
+        let indexing_errors_total = IntCounterVec::new(
+            Opts::new(
+                "indexing_errors_total",
+                "Total number of indexing cycle failures",
+            ),
+            &["stage"],
+        )?;
+        let job_queue_depth = prometheus::GaugeVec::new(
+            Opts::new("job_queue_depth", "Current depth of background job queues"),
+            &["queue"],
+        )?;
+
+        registry.register(Box::new(simulation_latency_seconds.clone()))?;
+        registry.register(Box::new(rpc_error_count_total.clone()))?;
+        registry.register(Box::new(simulation_requests_total.clone()))?;
+        registry.register(Box::new(resource_utilization_percent.clone()))?;
+        registry.register(Box::new(host_cpu_usage_percent.clone()))?;
+        registry.register(Box::new(host_memory_usage_percent.clone()))?;
+        registry.register(Box::new(process_memory_bytes.clone()))?;
+        registry.register(Box::new(indexing_latency_seconds.clone()))?;
+        registry.register(Box::new(events_processed_total.clone()))?;
+        registry.register(Box::new(indexing_errors_total.clone()))?;
+        registry.register(Box::new(job_queue_depth.clone()))?;
+
+        Ok(Self {
+            registry,
+            simulation_latency_seconds,
+            rpc_error_count_total,
+            simulation_requests_total,
+            resource_utilization_percent,
+            host_cpu_usage_percent,
+            host_memory_usage_percent,
+            process_memory_bytes,
+            indexing_latency_seconds,
+            events_processed_total,
+            indexing_errors_total,
+            job_queue_depth,
+        })
+    }
+}
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AnalyzeRequest {
@@ -518,7 +694,6 @@ pub struct TestnetAverages {
     pub cpu_instructions: u64,
     /// Average RAM bytes for typical Soroban transactions
     pub ram_bytes: u64,
-    /// Average ledger read bytes for typical Soroban transactions
     pub ledger_read_bytes: u64,
     /// Average ledger write bytes for typical Soroban transactions
     pub ledger_write_bytes: u64,
@@ -1824,6 +1999,7 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
+
 /// `/healthz` — Kubernetes liveness probe.
 ///
 /// Returns 200 OK as long as the process is running. No external dependency
@@ -1890,6 +2066,18 @@ async fn registry_gossip(
 
 #[tokio::main]
 async fn main() {
+    let cli = CliArgs::parse();
+
+    if cli.verbose {
+        env::set_var("RUST_LOG", "debug");
+    }
+    if !cli.rpc_url.is_empty() {
+        env::set_var("SOROBAN_RPC_URL", &cli.rpc_url);
+    }
+    if !cli.network_passphrase.is_empty() {
+        env::set_var("NETWORK_PASSPHRASE", &cli.network_passphrase);
+    }
+
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
@@ -1899,42 +2087,23 @@ async fn main() {
     // filtering without recompiling the binary.
     let config = load_config().expect("Failed to load configuration");
 
-    // ── Tracing init (Issue #16: Structured JSON & Logfmt + RUST_LOG filter) ────
-    let log_format_str = env::var("LOG_FORMAT").unwrap_or_else(|_| {
-        if config.log_format_json {
-            "json".to_string()
-        } else {
-            "compact".to_string()
-        }
-    });
-    let log_format: crate::logging::LogFormat = log_format_str.parse().unwrap_or_default();
-    let filter = crate::logging::build_env_filter(&config.rust_log);
-
-    match log_format {
-        crate::logging::LogFormat::Json => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_current_span(true)
-                        .with_span_list(true)
-                        .with_target(true),
-                )
-                .init();
-        }
-        crate::logging::LogFormat::Logfmt | crate::logging::LogFormat::Compact => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(tracing_subscriber::fmt::layer().compact().with_target(true))
-                .init();
-        }
-        crate::logging::LogFormat::Pretty => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(tracing_subscriber::fmt::layer().pretty().with_target(true))
-                .init();
-        }
+    // ── Tracing init (#572: JSON format + x-request-id correlation) ────
+    let log_json = env::var("LOG_FORMAT").map(|v| v.to_lowercase() == "json").unwrap_or(false);
+    let filter = EnvFilter::from_default_env();
+    if log_json {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().json())
+            .init();
+    } else {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
     }
 
     tracing::info!(rust_log = %config.rust_log, "SoroScope Starting...");
@@ -2274,11 +2443,10 @@ async fn main() {
             request_timeout: std::time::Duration::from_secs(30),
         };
 
-        let metrics = Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics"));
-        let leader_redis_client = redis::Client::open(config.redis_url.as_str())
-            .expect("Failed to create Redis client for leader lock");
-        let leader_lock = Arc::new(leader_lock::RedisLeaderLock::new(
-            leader_redis_client,
+        let metrics = Arc::new(AppMetrics::new().expect("Failed to create metrics"));
+        let redis_client = redis::Client::open(config.redis_url.as_str()).expect("Failed to create redis client");
+        let leader_lock = Arc::new(crate::leader_lock::RedisLeaderLock::new(
+            redis_client,
             "soroscope:leader:fee_collector",
             std::time::Duration::from_secs(30),
         ));
@@ -2413,9 +2581,6 @@ async fn main() {
         .expect("Failed to initialize job queue");
     // ── WebSocket event bus (#565: configurable bounded channel) ───────
     let simulation_bus = SimulationBus::with_capacity(config.event_bus_capacity);
-
-    // Spawn background cleanup task
-    worker_handles.push(job_queue.spawn_cleanup_task(shutdown_tx.subscribe()));
 
     let job_worker = JobWorker::new(
         job_queue.clone(),
@@ -2743,6 +2908,7 @@ async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
         }
     }
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Integration Tests
