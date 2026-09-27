@@ -81,6 +81,7 @@ where
             transaction_hash: None,
             latest_ledger: rpc_result.latest_ledger,
             cost_stroops,
+            rent_bytes: None,
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: rpc_result.transaction_data,

@@ -329,15 +329,17 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = body_of(response).await;
-        assert_eq!(json["error"], "BAD_REQUEST");
+        // Errors are RFC 7807 problem details, so the human-readable text lives
+        // in `detail`, not `message`.
+        assert_eq!(json["status"], 400);
+        assert_eq!(json["title"], "Bad Request");
+        assert_eq!(json["type"], "https://soroscope.dev/errors/bad-request");
+        let detail = json["detail"].as_str().unwrap();
         assert!(
-            json["message"]
-                .as_str()
-                .unwrap()
-                .contains("GABASEAXDYSSYMZ2IFEE6VS5MRVXE6MAQ6HJLHFDVKY3RP6GZXKNWWW3"),
+            detail.contains("GABASEAXDYSSYMZ2IFEE6VS5MRVXE6MAQ6HJLHFDVKY3RP6GZXKNWWW3"),
             "the error must name the account: {json}"
         );
-        assert!(json["message"].as_str().unwrap().contains("destination"));
+        assert!(detail.contains("destination"), "{json}");
     }
 
     #[tokio::test]
@@ -362,9 +364,9 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = body_of(response).await;
-        assert!(json["message"]
-            .as_str()
-            .unwrap()
-            .contains("must be positive"));
+        assert!(
+            json["detail"].as_str().unwrap().contains("must be positive"),
+            "{json}"
+        );
     }
 }
