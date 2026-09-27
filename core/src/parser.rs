@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soroban_sdk::xdr::{
-    Hash, Limits, ScAddress, ScMap, ScMapEntry, ScString, ScSymbol, ScVal, ScVec, StringM, Uint256,
-    VecM, WriteXdr,
+    Hash, Int128Parts, Limits, ScAddress, ScMap, ScMapEntry, ScString, ScSymbol, ScVal, ScVec,
+    StringM, Uint256, VecM, WriteXdr,
 };
 use stellar_strkey::Strkey;
 use thiserror::Error;
@@ -143,7 +143,7 @@ impl ArgParser {
         }
     }
 
-    fn parse_address(address: &str) -> Result<ScAddress, String> {
+    pub fn parse_address(address: &str) -> Result<ScAddress, String> {
         let strkey = Strkey::from_string(address).map_err(|e| e.to_string())?;
 
         match strkey {
@@ -155,6 +155,23 @@ impl ArgParser {
             }
             _ => Err("Unsupported address type".to_string()),
         }
+    }
+
+    /// Parse a decimal integer as a full 128-bit Soroban integer.
+    ///
+    /// JSON numbers cannot carry an `i128`, and a bare integer otherwise parses
+    /// as `i64`/`u64`. Anything that needs the wide type — SAC `transfer`
+    /// amounts are the motivating case — spells it `"i128:<decimal>"`.
+    pub fn parse_i128(text: &str) -> Result<ScVal, ParserError> {
+        let value: i128 = text.trim().parse().map_err(|e| ParserError::InvalidType {
+            location: "$".to_string(),
+            expected: "i128".to_string(),
+            found: format!("{text:?} ({e})"),
+        })?;
+        Ok(ScVal::I128(Int128Parts {
+            hi: (value >> 64) as i64,
+            lo: value as u64,
+        }))
     }
 }
 

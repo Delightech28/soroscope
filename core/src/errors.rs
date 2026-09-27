@@ -149,3 +149,21 @@ impl From<SimulationError> for AppError {
         }
     }
 }
+
+/// Convert a SAC transfer error, keeping the account name in the response so a
+/// caller can tell *which* balance is missing without re-reading the request.
+impl From<crate::sac_transfer::SacError> for AppError {
+    fn from(err: crate::sac_transfer::SacError) -> Self {
+        use crate::sac_transfer::SacError;
+        match err {
+            // Malformed input on the caller's side.
+            SacError::InvalidAccount { .. }
+            | SacError::InvalidAsset(_)
+            | SacError::InvalidNetwork(_)
+            | SacError::Xdr(_)
+            | SacError::BalanceEntryMissing { .. } => AppError::BadRequest(err.to_string()),
+            // Anything that came back from the node is a server-side problem.
+            SacError::Simulation(inner) => AppError::from(inner),
+        }
+    }
+}
