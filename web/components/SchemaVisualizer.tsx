@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import ReactFlow, {
   Background,
   BackgroundVariant,
@@ -53,12 +53,18 @@ function ContractNode({ data }: NodeProps<SchemaContractNodeData>) {
 }
 
 function StorageNode({ data }: NodeProps<SchemaStorageNodeData>) {
+  const isTemporary = data.source === 'temporary';
+  const isInstance = data.source === 'instance';
+  const kindLabel = isTemporary ? 'temporary' : isInstance ? 'instance' : 'persistent';
+  const kindClass = isTemporary
+    ? 'border-violet-500/60 bg-violet-500/10'
+    : isInstance
+      ? 'border-sky-500/60 bg-sky-500/10'
+      : 'border-slate-700 bg-slate-900/80';
   return (
     <div
       className={`min-w-[160px] max-w-[220px] rounded-lg border px-3 py-2 shadow-lg ${
-        data.written
-          ? 'border-amber-500/60 bg-amber-500/10'
-          : 'border-slate-700 bg-slate-900/80'
+        data.written ? 'border-amber-500/60 bg-amber-500/10' : kindClass
       }`}
     >
       <Handle type="target" position={Position.Left} className="!bg-slate-500" />
@@ -66,7 +72,7 @@ function StorageNode({ data }: NodeProps<SchemaStorageNodeData>) {
         {data.storageKey}
       </p>
       <p className="mt-0.5 text-[10px] uppercase tracking-wide text-slate-400">
-        {data.written ? 'written' : 'read'} &bull; {data.source}
+        {data.written ? 'written' : 'read'} &bull; {kindLabel}
         {data.remainingLedgers !== null && ` • TTL ${data.remainingLedgers}`}
       </p>
     </div>
@@ -90,9 +96,43 @@ export function SchemaVisualizer({
   includeStorage = true,
   height = 420,
 }: SchemaVisualizerProps) {
+  const [namespaceFilter, setNamespaceFilter] = useState<string>('all');
+
   const { nodes, edges, stats } = useMemo(
     () => buildSchemaGraph(report, { includeStorage }),
     [report, includeStorage],
+  );
+
+  const namespaces = useMemo(() => {
+    const set = new Set<string>();
+    for (const node of nodes) {
+      if (node.type === 'storage') {
+        const key = (node.data as SchemaStorageNodeData).storageKey;
+        const ns = key.includes('.') ? key.split('.')[0] : key;
+        set.add(ns);
+      }
+    }
+    return Array.from(set).sort();
+  }, [nodes]);
+
+  const visibleNodes = useMemo(() => {
+    if (namespaceFilter === 'all') return nodes;
+    return nodes.filter((node) => {
+      if (node.type !== 'storage') return true;
+      const key = (node.data as SchemaStorageNodeData).storageKey;
+      const ns = key.includes('.') ? key.split('.')[0] : key;
+      return ns === namespaceFilter;
+    });
+  }, [nodes, namespaceFilter]);
+
+  const visibleNodeIds = useMemo(
+    () => new Set(visibleNodes.map((node) => node.id)),
+    [visibleNodes],
+  );
+
+  const visibleEdges = useMemo(
+    () => edges.filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target)),
+    [edges, visibleNodeIds],
   );
 
   if (nodes.length === 0) {
@@ -118,11 +158,31 @@ export function SchemaVisualizer({
             {stats.hiddenStorageNodes > 0 && ` (+${stats.hiddenStorageNodes} hidden)`}
           </p>
         </div>
-        {stats.hasCycle && (
-          <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-300">
-            Re-entrant call detected
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {namespaces.length > 0 && (
+            <label className="flex items-center gap-1 text-[11px] text-slate-400">
+              <span className="uppercase tracking-wide">Namespace</span>
+              <select
+                value={namespaceFilter}
+                onChange={(event) => setNamespaceFilter(event.target.value)}
+                className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 font-mono text-[11px] text-slate-200"
+                data-testid="schema-namespace-filter"
+              >
+                <option value="all">all</option>
+                {namespaces.map((ns) => (
+                  <option key={ns} value={ns}>
+                    {ns}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {stats.hasCycle && (
+            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-300">
+              Re-entrant call detected
+            </span>
+          )}
+        </div>
       </div>
 
       <div
@@ -131,8 +191,8 @@ export function SchemaVisualizer({
         data-testid="schema-visualizer-canvas"
       >
         <ReactFlow
-          nodes={nodes as unknown as Node[]}
-          edges={edges as unknown as Edge[]}
+          nodes={visibleNodes as unknown as Node[]}
+          edges={visibleEdges as unknown as Edge[]}
           nodeTypes={nodeTypes}
           fitView
           minZoom={0.2}
