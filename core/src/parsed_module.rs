@@ -163,7 +163,7 @@ pub fn parse_module<'a>(wasm_bytes: &'a [u8]) -> Result<ParsedModule<'a>, ParseF
                 defined_ordinal += 1;
 
                 let operators = match body.get_operators_reader() {
-                    Ok(reader) => reader.into_iter().flatten().collect::<Vec<Operator>>(),
+                    Ok(reader) => reader.into_iter().flatten().collect::<Vec<Operator<'a>>>(),
                     // A body we cannot decode is recorded as empty rather than
                     // dropped, so the function keeps its index and location.
                     Err(_) => Vec::new(),

@@ -91,7 +91,7 @@ pub struct ContractErrorCode {
 impl ContractErrorCode {
     /// Resolve a `u32` discriminant against `contracts/error_codes`.
     pub fn from_code(code: u32) -> Self {
-        ContractErrorCode { code, name: contract_error_name(code).map(|s| s.to_string()) }
+        ContractErrorCode { code, name: contract_error_name(code).map(String::from) }
     }
 }
 
