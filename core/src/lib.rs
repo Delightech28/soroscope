@@ -24,6 +24,7 @@ pub mod leader_lock;
 pub mod merkle_tree;
 pub mod metrics;
 pub mod parser;
+pub mod parsed_module;
 pub mod routing;
 pub mod rpc_provider;
 pub mod rpc_throttle;
