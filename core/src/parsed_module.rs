@@ -257,7 +257,8 @@ mod tests {
 
     #[test]
     fn parses_a_minimal_module() {
-        let module = parse_module(&minimal_module()).expect("valid module");
+        let bytes = minimal_module();
+        let module = parse_module(&bytes).expect("valid module");
         assert_eq!(module.defined_function_count(), 1);
         assert_eq!(module.host_imports.len(), 0);
         assert_eq!(module.export_name(0), Some("run"));

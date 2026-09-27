@@ -294,9 +294,9 @@ mod tests {
         );
 
         assert_eq!(failure.kind, FailureKind::ContractTrap);
-        let code = failure.contract_error.expect("a discriminant was present");
+        let code = failure.contract_error.as_ref().expect("a discriminant was present");
         assert_eq!(code.code, 3);
-        assert_eq!(code.name, Some("Unauthorized"));
+        assert_eq!(code.name.as_deref(), Some("Unauthorized"));
         assert!(failure.describe().contains("contracterror #3 (Unauthorized)"), "got {}", failure.describe());
     }
 
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn an_unknown_error_code_keeps_the_integer_and_has_no_name() {
         let failure = ExecutionFailure::from_diagnostic("HostError: Error(Contract, #9999)");
-        let code = failure.contract_error.expect("code present");
+        let code = failure.contract_error.as_ref().expect("code present");
         assert_eq!(code.code, 9999);
         assert_eq!(code.name, None);
         assert!(failure.describe().contains("contracterror #9999"));
