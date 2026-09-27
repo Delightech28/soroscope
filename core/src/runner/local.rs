@@ -121,6 +121,7 @@ impl LocalRunner {
 
         Ok(SimulationResult {
             cost_stroops: estimate_cost_stroops(&resources),
+            rent_bytes: None,
             resources,
             transaction_hash: None,
             latest_ledger: 0,

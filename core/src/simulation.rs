@@ -812,6 +812,11 @@ pub struct SimulationResult {
     pub transaction_hash: Option<String>,
     pub latest_ledger: u64,
     pub cost_stroops: u64,
+    /// Rent charged by the simulation, in bytes of rent. Absent on
+    /// pre-protocol-20 nodes, and unusable for a refund estimate without a
+    /// durability split, so it is optional and never defaulted to zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rent_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_dependency: Option<Vec<StateDependency>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -948,7 +953,7 @@ struct RpcError {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct SimulationRpcResult {
+pub struct SimulationRpcResult {
     #[serde(default)]
     transaction_data: String,
     #[serde(default)]
@@ -968,6 +973,10 @@ struct SimulationRpcResult {
 struct ResourceCost {
     cpu_insns: String,
     mem_bytes: String,
+    /// Total rent charged. Present on protocol >= 20 RPCs; absent on older
+    /// nodes, which is why it is an `Option` all the way through.
+    #[serde(default)]
+    rent_bytes: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -2656,10 +2665,11 @@ impl SimulationEngine {
             .collect()
     }
 
-    fn parse_simulation_result(
+    pub(crate) fn parse_simulation_result(
         &self,
         rpc_result: SimulationRpcResult,
     ) -> Result<SimulationResult, SimulationError> {
+        let mut rent_bytes: Option<u64> = None;
         let resources = if let Some(cost) = rpc_result.cost {
             let cpu_instructions = cost.cpu_insns.parse::<u64>().unwrap_or_else(|_| {
                 tracing::warn!("Failed to parse cpu_insns, using 0");
@@ -2669,6 +2679,19 @@ impl SimulationEngine {
                 tracing::warn!("Failed to parse mem_bytes, using 0");
                 0
             });
+            // Absent on pre-protocol-20 nodes, and a refund estimate is only
+            // meaningful with it, so a missing value stays `None` all the way to
+            // the fee quote rather than being defaulted to zero.
+            rent_bytes = cost
+                .rent_bytes
+                .as_ref()
+                .and_then(|raw| match raw.parse::<u64>() {
+                    Ok(value) => Some(value),
+                    Err(e) => {
+                        tracing::warn!("Failed to parse rent_bytes: {}", e);
+                        None
+                    }
+                });
             let (ledger_read_bytes, ledger_write_bytes) =
                 self.extract_footprint_from_xdr(&rpc_result.transaction_data);
             SorobanResources {
@@ -2689,6 +2712,7 @@ impl SimulationEngine {
             transaction_hash: None,
             latest_ledger: rpc_result.latest_ledger,
             cost_stroops,
+            rent_bytes,
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: rpc_result.transaction_data,
@@ -2879,6 +2903,15 @@ impl SimulationEngine {
 
     pub(crate) fn parse_sc_val_arg(&self, arg: &str) -> Result<ScVal, SimulationError> {
         let arg = arg.trim();
+
+        // 0. Explicit wide-integer form. Checked before JSON because a bare
+        //    integer would otherwise land on i64, and contracts that take an
+        //    i128 (SAC `transfer` amounts, for one) reject the call with a type
+        //    error that gives no hint about the real problem.
+        if let Some(rest) = arg.strip_prefix(crate::sac_transfer::I128_ARG_PREFIX) {
+            return ArgParser::parse_i128(rest)
+                .map_err(|e| SimulationError::NodeError(e.to_string()));
+        }
 
         // 1. Try parsing as JSON first (for complex types like Maps and Vecs)
         if arg.starts_with('{') || arg.starts_with('[') {
@@ -3602,6 +3635,7 @@ mod tests {
             transaction_hash: None,
             latest_ledger: 1000,
             cost_stroops: 1,
+            rent_bytes: None,
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: "AAA=".to_string(),
@@ -3634,6 +3668,7 @@ mod tests {
             transaction_hash: None,
             latest_ledger: 1000,
             cost_stroops: 1,
+            rent_bytes: None,
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: "AAA=".to_string(),
@@ -4017,6 +4052,7 @@ mod tests {
                 transaction_hash: None,
                 latest_ledger: 42,
                 cost_stroops: 10,
+                rent_bytes: None,
                 state_dependency: None,
                 ttl_analysis: None,
                 transaction_data: "AAA=".to_string(),

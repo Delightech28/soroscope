@@ -88,6 +88,7 @@ mod tests {
                 transaction_hash: None,
                 latest_ledger: ledger,
                 cost_stroops: cost,
+                rent_bytes: Some(0),
                 state_dependency: None,
                 ttl_analysis: None,
                 transaction_data: td,

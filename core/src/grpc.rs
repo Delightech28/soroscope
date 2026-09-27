@@ -425,6 +425,7 @@ mod tests {
                 ledger_write_bytes: 256,
                 transaction_size_bytes: 400,
                 cost_stroops: 500,
+                rent_bytes: None,
             },
             timestamp: Utc::now(),
         }

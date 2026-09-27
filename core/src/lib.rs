@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+pub mod api_routes;
 pub mod auth;
 pub mod benchmarks;
 pub mod cache;
@@ -13,6 +14,7 @@ pub mod engine;
 pub mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
+pub mod fee_quote;
 pub mod fee_store;
 pub mod gas_golfing;
 pub mod graphql;
@@ -27,6 +29,7 @@ pub mod routing;
 pub mod rpc_provider;
 pub mod rpc_throttle;
 pub mod runner;
+pub mod sac_transfer;
 pub mod simulation;
 pub mod simulation_service;
 pub mod sys_alarms;
