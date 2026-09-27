@@ -277,44 +277,32 @@ impl InsightRule for MemoryPressureRule {
     }
 }
 
-/// Detects repeated reads and writes of the same ledger key within a single invocation.
-pub struct RepeatedKeyAccessRule;
+/// Recommends migrating persistent configuration keys written once at init and read on every call to instance storage.
+pub struct InstanceStorageConfigRule;
 
-impl InsightRule for RepeatedKeyAccessRule {
+impl InsightRule for InstanceStorageConfigRule {
     fn name(&self) -> &str {
-        "repeated_key_access"
+        "instance_storage_recommendation"
     }
 
     fn evaluate(&self, r: &SorobanResources) -> Vec<Insight> {
         let mut out = Vec::new();
 
-        if let Some(trace) = &r.access_trace {
-            if trace.status == "available" {
-                for key_analysis in &trace.flagged_keys {
-                    if key_analysis.multiple_writes {
-                        out.push(Insight {
-                            severity: Severity::Warning,
-                            rule: self.name().to_string(),
-                            message: format!(
-                                "Ledger key '{}' was written {} times during invocation",
-                                key_analysis.key, key_analysis.write_count
-                            ),
-                            suggested_fix: "Mutate a local variable and perform a single write at the end of execution."
-                                .to_string(),
-                        });
-                    }
-                    if key_analysis.read_after_write {
-                        out.push(Insight {
-                            severity: Severity::Warning,
-                            rule: self.name().to_string(),
-                            message: format!(
-                                "Ledger key '{}' was read after being written in the same invocation",
-                                key_analysis.key
-                            ),
-                            suggested_fix: "Reuse the local value in scope instead of re-reading from storage."
-                                .to_string(),
-                        });
-                    }
+        if let Some(report) = &r.instance_storage_report {
+            if report.status == "available" {
+                for candidate in &report.candidates {
+                    out.push(Insight {
+                        severity: Severity::Warning,
+                        rule: self.name().to_string(),
+                        message: format!(
+                            "Persistent key '{}' is written once at init and read {} times across scenario — consider migrating to instance storage",
+                            candidate.key, candidate.total_reads_after_init
+                        ),
+                        suggested_fix: format!(
+                            "Move '{}' to instance storage (save ~{} read bytes, ~{} stroops rent delta)",
+                            candidate.key, candidate.estimated_read_bytes_saved, candidate.estimated_rent_savings_stroops
+                        ),
+                    });
                 }
             }
         }
@@ -346,7 +334,7 @@ impl InsightsEngine {
                 Box::new(InstructionDensityRule),
                 Box::new(FootprintBloatRule),
                 Box::new(MemoryPressureRule),
-                Box::new(RepeatedKeyAccessRule),
+                Box::new(InstanceStorageConfigRule),
             ],
         }
     }
@@ -691,32 +679,22 @@ mod tests {
         assert_eq!(report, deserialized);
     }
 
-    // ── Repeated key access rule ──────────────────────────────────────────
+    // ── Instance storage config recommendation rule ───────────────────────
 
     #[test]
-    fn test_repeated_key_access_rule_none_or_unavailable() {
-        let rule = RepeatedKeyAccessRule;
-        let r = SorobanResources::default();
-        assert!(rule.evaluate(&r).is_empty());
-    }
+    fn test_instance_storage_config_rule() {
+        use crate::simulation::{InstanceStorageRecommendationReport, WriteOnceReadManyCandidate};
 
-    #[test]
-    fn test_repeated_key_access_rule_multiple_writes() {
-        use crate::simulation::{KeyAccessAnalysis, LedgerAccessTraceReport};
-
-        let rule = RepeatedKeyAccessRule;
+        let rule = InstanceStorageConfigRule;
         let r = SorobanResources {
-            access_trace: Some(LedgerAccessTraceReport {
+            instance_storage_report: Some(InstanceStorageRecommendationReport {
                 status: "available".to_string(),
-                access_list: vec![],
-                analyzed_keys: vec![],
-                flagged_keys: vec![KeyAccessAnalysis {
-                    key: "COUNTER".to_string(),
-                    durability: "persistent".to_string(),
-                    read_count: 1,
-                    write_count: 3,
-                    multiple_writes: true,
-                    read_after_write: false,
+                candidates: vec![WriteOnceReadManyCandidate {
+                    key: "ADMIN_CONFIG".to_string(),
+                    first_step_written: 0,
+                    total_reads_after_init: 3,
+                    estimated_read_bytes_saved: 192,
+                    estimated_rent_savings_stroops: 1920,
                 }],
             }),
             ..Default::default()
@@ -725,38 +703,8 @@ mod tests {
         let insights = rule.evaluate(&r);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
-        assert_eq!(insights[0].rule, "repeated_key_access");
-        assert!(insights[0].message.contains("COUNTER"));
-        assert!(insights[0].message.contains("written 3 times"));
-    }
-
-    #[test]
-    fn test_repeated_key_access_rule_read_after_write() {
-        use crate::simulation::{KeyAccessAnalysis, LedgerAccessTraceReport};
-
-        let rule = RepeatedKeyAccessRule;
-        let r = SorobanResources {
-            access_trace: Some(LedgerAccessTraceReport {
-                status: "available".to_string(),
-                access_list: vec![],
-                analyzed_keys: vec![],
-                flagged_keys: vec![KeyAccessAnalysis {
-                    key: "USER_BAL".to_string(),
-                    durability: "instance".to_string(),
-                    read_count: 2,
-                    write_count: 1,
-                    multiple_writes: false,
-                    read_after_write: true,
-                }],
-            }),
-            ..Default::default()
-        };
-
-        let insights = rule.evaluate(&r);
-        assert_eq!(insights.len(), 1);
-        assert_eq!(insights[0].severity, Severity::Warning);
-        assert_eq!(insights[0].rule, "repeated_key_access");
-        assert!(insights[0].message.contains("USER_BAL"));
-        assert!(insights[0].message.contains("read after being written"));
+        assert_eq!(insights[0].rule, "instance_storage_recommendation");
+        assert!(insights[0].message.contains("ADMIN_CONFIG"));
+        assert!(insights[0].suggested_fix.contains("192 read bytes"));
     }
 }
