@@ -17,9 +17,22 @@ interface DynamicFormProps {
   loading?: boolean;
 }
 
+// Soroban spec XDR parameter types that carry structured / complex values.
+const COMPLEX_TYPES = ['vector', 'vec', 'struct', 'map', 'tuple', 'option', 'bytes', 'bytesn'];
+
+function isComplexType(type: string): boolean {
+  const normalized = type.toLowerCase();
+  return COMPLEX_TYPES.some((t) => normalized === t || normalized.startsWith(`${t}<`) || normalized.startsWith(`${t}(`));
+}
+
+function isNumericType(type: string): boolean {
+  return /^(u|i)(32|64|128|256)$/.test(type.toLowerCase());
+}
+
 export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = false, loading }: DynamicFormProps) {
   const [formData, setFormData] = useState<SimulationInputs>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [jsonMode, setJsonMode] = useState<Record<string, boolean>>({});
 
   const handleChange = (name: string, value: string | number | boolean) => {
     const updatedData = { ...formData, [name]: value };
@@ -47,6 +60,10 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
     return typeof value === 'boolean' ? String(value) : value ?? '';
   };
 
+  const toggleJsonMode = (name: string) => {
+    setJsonMode((prev) => ({ ...prev, [name]: !prev[name] }));
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -54,6 +71,14 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
     for (const input of func.inputs) {
       const raw = fieldValue(input.name);
       if (!input.optional || raw !== '') {
+        if (isComplexType(input.type) && jsonMode[input.name]) {
+          try {
+            JSON.parse(String(raw));
+          } catch {
+            newErrors[input.name] = 'Invalid JSON';
+            continue;
+          }
+        }
         const result = validateField(input.type, raw);
         if (!result.success) {
           newErrors[input.name] = result.error ?? 'Invalid value';
@@ -89,6 +114,8 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
       ) : (
         func.inputs.map((input) => {
           const hasError = !!errors[input.name];
+          const complex = isComplexType(input.type);
+          const useJson = complex && jsonMode[input.name];
 
           return (
           <div
@@ -112,6 +139,9 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
               ) : (
                 <span style={{ color: '#fb8500' }}>*</span>
               )}
+              <span style={{ color: 'var(--text-secondary)', marginLeft: '6px', fontSize: '12px' }}>
+                {input.type}
+              </span>
             </label>
             {input.description && (
               <p
@@ -124,7 +154,36 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
                 {input.description}
               </p>
             )}
-            {input.type === 'address' ? (
+            {complex && (
+              <button
+                type="button"
+                onClick={() => toggleJsonMode(input.name)}
+                disabled={loading}
+                style={{
+                  alignSelf: 'flex-start',
+                  padding: '2px 8px',
+                  fontSize: '12px',
+                  backgroundColor: 'transparent',
+                  color: '#00d9ff',
+                  border: '1px solid var(--border-default)',
+                  borderRadius: '4px',
+                  cursor: loading ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {useJson ? 'Use structured input' : 'Use JSON input'}
+              </button>
+            )}
+            {useJson ? (
+              <textarea
+                placeholder={`Enter ${input.type} as JSON`}
+                value={fieldValue(input.name)}
+                onChange={(e) => handleChange(input.name, e.target.value)}
+                required={!input.optional}
+                disabled={loading}
+                rows={4}
+                style={{ ...inputStyle(hasError), fontFamily: 'monospace', resize: 'vertical' }}
+              />
+            ) : input.type === 'address' ? (
               <input
                 type="text"
                 placeholder="Enter Stellar address (G...)"
@@ -134,7 +193,7 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
                 disabled={loading}
                 style={{ ...inputStyle(hasError), fontFamily: 'monospace' }}
               />
-            ) : input.type === 'u32' || input.type === 'u128' || input.type === 'i128' ? (
+            ) : isNumericType(input.type) ? (
               <input
                 type="text"
                 placeholder={`Enter ${input.type} value`}
