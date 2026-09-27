@@ -858,6 +858,14 @@ pub struct WasmBranchAnalysisResponse {
     pub best_case_resources: crate::simulation::SorobanResources,
     /// Number of distinct resource profiles observed.
     pub distinct_profiles: usize,
+    /// Static branch points no explored input was observed to exercise (#1009).
+    pub uncovered_branches: Vec<crate::wasm_branch_analysis::BranchInfo>,
+    /// What the coverage claim rests on.
+    pub coverage_basis: crate::wasm_branch_analysis::BranchCoverageBasis,
+    /// Simulations performed, including the baseline.
+    pub runs_used: usize,
+    /// Hard cap on simulations for this analysis.
+    pub run_budget: usize,
     /// Human-readable note about path coverage.
     pub coverage_note: String,
 }
@@ -1367,6 +1375,10 @@ async fn analyze_wasm_branches(
         worst_case_resources: report.worst_case_resources,
         best_case_resources: report.best_case_resources,
         distinct_profiles: report.distinct_profiles,
+        uncovered_branches: report.uncovered_branches,
+        coverage_basis: report.coverage_basis,
+        runs_used: report.runs_used,
+        run_budget: report.run_budget,
         coverage_note: report.coverage_note,
     }))
 }
