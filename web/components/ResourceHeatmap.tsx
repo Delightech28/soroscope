@@ -1,4 +1,5 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+// Issue #814: Canvas heatmap renderer & matrix visualization
+import React, { useState } from 'react';
 import { Cpu, Database, HardDrive, Zap, Activity, Info, Sliders, Grid, AlertTriangle } from 'lucide-react';
 import { cn } from '../lib/utils';
 import type { CallGraph, CallNode } from '../lib/sorobantypes';
