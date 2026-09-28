@@ -86,9 +86,9 @@ export function OfflineBanner() {
     <AnimatePresence mode="wait">
       <motion.div
         key={offlineState}
-        initial={{ height: 0, opacity: 0 }}
-        animate={{ height: "auto", opacity: 1 }}
-        exit={{ height: 0, opacity: 0 }}
+        initial={{ height: 0, opacity: 0, y: -20 }}
+        animate={{ height: "auto", opacity: 1, y: 0 }}
+        exit={{ height: 0, opacity: 0, y: -20 }}
         transition={{ duration: 0.3, ease: "easeInOut" }}
         className="overflow-hidden"
       >
