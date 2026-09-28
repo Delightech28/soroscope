@@ -387,6 +387,17 @@ export function UploadZone({
   const onDropAccepted = useCallback(
     async (files: File[]) => {
       const file = files[0];
+      if (!file.name.toLowerCase().endsWith('.wasm')) {
+        setErrorMessage("File must have a .wasm extension");
+        setErrorDetails({
+          title: 'Invalid File Type',
+          message: "File must have a .wasm extension",
+          suggestedAction: 'Please upload a compiled .wasm file.',
+        });
+        setUploadState('error');
+        setDroppedFile(null);
+        return;
+      }
       setDroppedFile({ name: file.name, sizeBytes: file.size });
       setErrorMessage('');
       setErrorDetails(null);
