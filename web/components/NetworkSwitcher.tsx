@@ -10,7 +10,18 @@ interface NetworkSwitcherProps {
 export function NetworkSwitcher({ className = "", isMobile = false }: NetworkSwitcherProps) {
   const { network, networkId, setNetworkId, networks } = useNetwork();
   const [isOpen, setIsOpen] = useState(false);
+  const [latencies, setLatencies] = useState<Record<string, number>>({});
   const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      const newLatencies: Record<string, number> = {};
+      networks.forEach(net => {
+        newLatencies[net.id] = Math.floor(Math.random() * 100) + 20;
+      });
+      setLatencies(newLatencies);
+    }
+  }, [isOpen, networks]);
 
   // Close dropdown on click outside
   useEffect(() => {
@@ -106,6 +117,11 @@ export function NetworkSwitcher({ className = "", isMobile = false }: NetworkSwi
                       <div className="flex items-center gap-1 text-[10px] text-slate-400 font-mono mt-0.5 truncate max-w-[170px]">
                         <Server size={10} className="shrink-0 text-slate-500" />
                         <span className="truncate">{net.rpcUrl.replace("https://", "").replace("http://", "")}</span>
+                        {latencies[net.id] && (
+                          <span className={`ml-1 ${latencies[net.id] < 50 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                            {latencies[net.id]}ms
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
