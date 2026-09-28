@@ -38,12 +38,14 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
     },
+    http::HeaderMap,
     response::IntoResponse,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tracing::Instrument;
 
 use crate::jobs::JobId;
 use crate::trace_propagation::TracedMessage;
@@ -307,10 +309,17 @@ pub struct WsState {
 /// or the client disconnects.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     Path(job_id): Path<String>,
     State(state): State<Arc<crate::AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, job_id, state))
+    let parent = crate::trace_propagation::extract_http(&headers);
+    ws.on_upgrade(move |socket| {
+        let span = tracing::info_span!("websocket.session", job_id = %job_id);
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        span.set_parent(parent);
+        handle_socket(socket, job_id, state).instrument(span)
+    })
 }
 
 async fn handle_socket(mut socket: WebSocket, job_id: String, state: Arc<crate::AppState>) {
@@ -625,4 +634,3 @@ mod tests {
         assert_eq!(manager.stats().active_connections, 1);
     }
 }
-

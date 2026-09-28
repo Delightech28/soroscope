@@ -2151,6 +2151,24 @@ async fn main() {
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
+    // Configure OTLP export only when an endpoint is explicitly supplied.
+    // Both Jaeger OTLP and the OpenTelemetry Collector accept this endpoint.
+    if let Ok(endpoint) = env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        match opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+        {
+            Ok(exporter) => {
+                let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+                    .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                    .build();
+                opentelemetry::global::set_tracer_provider(provider);
+            }
+            Err(error) => eprintln!("Failed to configure OTLP tracing exporter: {error}"),
+        }
+    }
+
     // Config is loaded before the tracing subscriber so `rust_log` (sourced
     // from the `RUST_LOG` env var, defaulting to "info") can drive log level
     // filtering without recompiling the binary.
@@ -2882,6 +2900,7 @@ async fn main() {
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(trace_propagation::http_trace_middleware))
         // ── x-request-id (#572) ───────────────────────────────────────
         // Assigns a UUID to every inbound request under the `x-request-id`
         // header and propagates it to outbound responses so clients can
