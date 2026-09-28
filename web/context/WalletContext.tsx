@@ -207,26 +207,26 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
     setIsModalOpen(false);
   };
 
+  const contextValue = React.useMemo(() => ({
+    connect: connectWallet,
+    disconnect,
+    address,
+    isConnected: !!address,
+    isConnecting,
+    selectedWalletId,
+    openModal,
+    closeModal,
+    isModalOpen,
+    supportedWallets,
+    error,
+    balances,
+    balancesLoading,
+    balancesError,
+    refreshBalances,
+  }), [address, isConnecting, selectedWalletId, isModalOpen, error, balances, balancesLoading, balancesError, refreshBalances]);
+
   return (
-    <WalletContext.Provider
-      value={{
-        connect: connectWallet,
-        disconnect,
-        address,
-        isConnected: !!address,
-        isConnecting,
-        selectedWalletId,
-        openModal,
-        closeModal,
-        isModalOpen,
-        supportedWallets,
-        error,
-        balances,
-        balancesLoading,
-        balancesError,
-        refreshBalances,
-      }}
-    >
+    <WalletContext.Provider value={contextValue}>
       {children}
     </WalletContext.Provider>
   );
