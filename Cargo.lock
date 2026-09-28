@@ -4847,6 +4847,7 @@ dependencies = [
  "moka",
  "opentelemetry",
  "opentelemetry-otlp",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
  "prometheus",
  "proptest",

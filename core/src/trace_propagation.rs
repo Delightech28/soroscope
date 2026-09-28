@@ -50,7 +50,10 @@ impl<T> TracedMessage<T> {
 pub fn inject_http(headers: &mut HeaderMap) {
     inject_map(|carrier| {
         for (key, value) in carrier {
-            if let (Ok(name), Ok(value)) = (key.parse(), HeaderValue::from_str(&value)) {
+            if let (Ok(name), Ok(value)) = (
+                key.parse::<axum::http::HeaderName>(),
+                HeaderValue::from_str(&value),
+            ) {
                 headers.insert(name, value);
             }
         }
@@ -74,7 +77,10 @@ pub fn extract_http(headers: &HeaderMap) -> opentelemetry::Context {
 pub fn inject_grpc(metadata: &mut MetadataMap) {
     inject_map(|carrier| {
         for (key, value) in carrier {
-            if let (Ok(key), Ok(value)) = (key.parse(), MetadataValue::try_from(value.as_str())) {
+            if let (Ok(key), Ok(value)) = (
+                key.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>(),
+                MetadataValue::try_from(value.as_str()),
+            ) {
                 metadata.insert(key, value);
             }
         }
@@ -131,8 +137,17 @@ impl Extractor for MapExtractor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry::trace::{SpanContext, TraceContextExt, TraceFlags, TraceId, TraceState};
+    use opentelemetry::trace::{
+        SpanContext, TraceContextExt, TraceFlags, TraceId, TraceState, TracerProvider as _,
+    };
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_proto::tonic::collector::trace::v1::{
+        trace_service_server::{TraceService, TraceServiceServer},
+        ExportTraceServiceRequest, ExportTraceServiceResponse,
+    };
     use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use std::sync::{Arc, Mutex};
+    use tokio_stream::wrappers::TcpListenerStream;
     use tracing_subscriber::layer::SubscriberExt;
 
     const TRACEPARENT: &str = "00-00000000000000000000000000000001-0000000000000002-01";
@@ -153,6 +168,135 @@ mod tests {
         metadata.insert("traceparent", MetadataValue::try_from(TRACEPARENT).unwrap());
         let context = extract_grpc(&metadata);
         assert_eq!(context.span().span_context().trace_id(), TraceId::from(1));
+    }
+
+    #[test]
+    fn missing_and_malformed_traceparent_have_no_remote_parent() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let empty_http = HeaderMap::new();
+        let empty_websocket = HeaderMap::new();
+        let empty_grpc = MetadataMap::new();
+        assert!(!extract_http(&empty_http).span().span_context().is_valid());
+        assert!(!extract_http(&empty_websocket)
+            .span()
+            .span_context()
+            .is_valid());
+        assert!(!extract_grpc(&empty_grpc).span().span_context().is_valid());
+
+        let mut malformed_http = HeaderMap::new();
+        malformed_http.insert("traceparent", HeaderValue::from_static("not-a-traceparent"));
+        let mut malformed_websocket = HeaderMap::new();
+        malformed_websocket.insert("traceparent", HeaderValue::from_static("not-a-traceparent"));
+        let mut malformed_grpc = MetadataMap::new();
+        malformed_grpc.insert(
+            "traceparent",
+            MetadataValue::from_static("not-a-traceparent"),
+        );
+        assert!(!extract_http(&malformed_http)
+            .span()
+            .span_context()
+            .is_valid());
+        assert!(!extract_http(&malformed_websocket)
+            .span()
+            .span_context()
+            .is_valid());
+        assert!(!extract_grpc(&malformed_grpc)
+            .span()
+            .span_context()
+            .is_valid());
+    }
+
+    #[derive(Default)]
+    struct Receiver(Arc<Mutex<Vec<opentelemetry_proto::tonic::trace::v1::Span>>>);
+
+    #[tonic::async_trait]
+    impl TraceService for Receiver {
+        async fn export(
+            &self,
+            request: tonic::Request<ExportTraceServiceRequest>,
+        ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
+            let spans = request
+                .into_inner()
+                .resource_spans
+                .into_iter()
+                .flat_map(|resource| resource.scope_spans)
+                .flat_map(|scope| scope.spans);
+            self.0.lock().unwrap().extend(spans);
+            Ok(tonic::Response::new(ExportTraceServiceResponse {
+                partial_success: None,
+            }))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_grpc_and_websocket_spans_reach_one_otlp_trace() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let receiver = Receiver::default();
+        let received = receiver.0.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(TraceServiceServer::new(receiver))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+            .unwrap();
+        let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("propagation-test")));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut http_headers = HeaderMap::new();
+            http_headers.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
+            let http = tracing::info_span!("http.request");
+            http.set_parent(extract_http(&http_headers));
+            let _http_guard = http.enter();
+
+            let mut grpc_metadata = MetadataMap::new();
+            inject_grpc(&mut grpc_metadata);
+            assert!(grpc_metadata.get("traceparent").is_some());
+            let grpc = tracing::info_span!("grpc.request");
+            grpc.set_parent(extract_grpc(&grpc_metadata));
+            let _grpc_guard = grpc.enter();
+
+            let mut ws_headers = HeaderMap::new();
+            inject_http(&mut ws_headers);
+            assert!(ws_headers.get("traceparent").is_some());
+            let websocket = tracing::info_span!("websocket.session");
+            websocket.set_parent(extract_http(&ws_headers));
+            let _websocket_guard = websocket.enter();
+        });
+
+        for result in provider.force_flush() {
+            result.unwrap();
+        }
+        {
+            let spans = received.lock().unwrap();
+            let names: Vec<_> = spans.iter().map(|span| span.name.as_str()).collect();
+            assert!(names.contains(&"http.request"), "exported spans: {names:?}");
+            assert!(names.contains(&"grpc.request"), "exported spans: {names:?}");
+            assert!(
+                names.contains(&"websocket.session"),
+                "exported spans: {names:?}"
+            );
+            assert!(spans
+                .iter()
+                .all(|span| span.trace_id == TraceId::from(1).to_bytes()));
+        }
+        let _ = shutdown_tx.send(());
+        server.await.unwrap();
     }
 
     #[test]
