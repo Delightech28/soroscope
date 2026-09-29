@@ -101,6 +101,9 @@ function AssetRow({
 export function WalletBalanceCard() {
   const {
     isConnected,
+    address,
+    networkName,
+    selectedWalletName,
     balances,
     balancesLoading,
     balancesError,
@@ -154,6 +157,23 @@ export function WalletBalanceCard() {
             className={cn("h-4 w-4", refreshing && "animate-spin")}
           />
         </button>
+      </div>
+
+      <div className="mb-4 grid gap-2 rounded-xl border border-[#1e293b] bg-[#0F1621] px-4 py-3 text-xs text-slate-400 sm:grid-cols-3">
+        <div>
+          <p className="mb-1 uppercase tracking-wide text-slate-500">Account</p>
+          <p className="truncate font-mono text-slate-100" title={address ?? undefined}>
+            {address}
+          </p>
+        </div>
+        <div>
+          <p className="mb-1 uppercase tracking-wide text-slate-500">Network</p>
+          <p className="font-semibold text-[#33C5E0]">{networkName}</p>
+        </div>
+        <div>
+          <p className="mb-1 uppercase tracking-wide text-slate-500">Wallet</p>
+          <p className="font-semibold text-slate-100">{selectedWalletName ?? "Connected wallet"}</p>
+        </div>
       </div>
 
       <div className="mb-4 rounded-xl bg-gradient-to-br from-[#33C5E0]/10 to-transparent px-4 py-3">
