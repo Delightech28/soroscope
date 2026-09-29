@@ -1,6 +1,10 @@
 import React, { useState, useMemo } from 'react';
-import { calculateStakingYield } from '../lib/stakingCalculator';
-import { Calculator, TrendingUp, Calendar, Zap, DollarSign, RefreshCw, BarChart2 } from 'lucide-react';
+import {
+  calculateStakingYield,
+  sanitizeNumericInput,
+  STAKING_INPUT_LIMITS,
+} from '../lib/stakingCalculator';
+import { Calculator, TrendingUp, Calendar, Zap, DollarSign, BarChart2 } from 'lucide-react';
 
 export interface StakingCalculatorProps {
   initialDeposit?: number;
@@ -75,10 +79,16 @@ export function StakingCalculator({
                 <input
                   id="deposit-amount-input"
                   type="number"
-                  min="0"
-                  max="1000000"
+                  min={STAKING_INPUT_LIMITS.depositAmount.min}
+                  max={STAKING_INPUT_LIMITS.depositAmount.max}
+                  step="any"
+                  inputMode="decimal"
                   value={depositAmount}
-                  onChange={(e) => setDepositAmount(Math.max(0, Number(e.target.value)))}
+                  onChange={(e) =>
+                    setDepositAmount(
+                      sanitizeNumericInput(e.target.value, STAKING_INPUT_LIMITS.depositAmount)
+                    )
+                  }
                   className="w-28 rounded border border-slate-700 bg-slate-950 px-2 py-0.5 text-right font-mono text-slate-100 focus:border-cyan-400 focus:outline-none"
                 />
               </div>
@@ -162,11 +172,16 @@ export function StakingCalculator({
                 <input
                   id="base-apy-input"
                   type="number"
-                  min="0"
-                  max="100"
+                  min={STAKING_INPUT_LIMITS.baseApyPercentage.min}
+                  max={STAKING_INPUT_LIMITS.baseApyPercentage.max}
                   step="0.1"
+                  inputMode="decimal"
                   value={baseApyPercentage}
-                  onChange={(e) => setBaseApyPercentage(Math.max(0, Number(e.target.value)))}
+                  onChange={(e) =>
+                    setBaseApyPercentage(
+                      sanitizeNumericInput(e.target.value, STAKING_INPUT_LIMITS.baseApyPercentage)
+                    )
+                  }
                   className="w-20 rounded border border-slate-700 bg-slate-950 px-2 py-0.5 text-right font-mono text-slate-100 focus:border-cyan-400 focus:outline-none"
                 />
                 <span>%</span>

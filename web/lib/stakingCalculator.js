@@ -2,6 +2,17 @@
  * Staking & Yield Calculator Logic
  */
 
+/**
+ * Inclusive bounds for every numeric field rendered by the staking widget.
+ * The UI inputs and the yield maths both read from this single source of
+ * truth so a value can never be rendered/calculated outside a sane range.
+ */
+const STAKING_INPUT_LIMITS = {
+  depositAmount: { min: 0, max: 1000000 },
+  lockDurationMonths: { min: 1, max: 36 },
+  baseApyPercentage: { min: 0, max: 100 },
+};
+
 const COMPOUND_FREQUENCIES = {
   daily: 365,
   weekly: 52,
@@ -34,6 +45,30 @@ function getDurationTierMultiplier(months) {
 }
 
 /**
+ * Coerce a raw numeric field value (usually a string straight out of an
+ * `<input type="number">`) into a finite number clamped to `[min, max]`.
+ *
+ * Typing `-`, a lone `e`, pasting arbitrary text or overflowing the field
+ * (e.g. `1e400`) makes the browser hand back a value that is not a usable
+ * number: `Number()` yields `NaN`, and `Math.max(0, NaN)` is still `NaN`,
+ * which used to leak `NaN`/`Infinity` into every projection in the widget.
+ *
+ * Resolution rules: blank/unparseable text collapses to `min` (0 for
+ * deposits/APY), a value that overflows to `+Infinity` saturates at `max`, and
+ * `-Infinity` saturates at `min`. The result is always a finite, in-range
+ * number.
+ */
+function sanitizeNumericInput(rawValue, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = typeof rawValue === 'number' ? rawValue : Number(String(rawValue ?? '').trim());
+
+  if (Number.isNaN(parsed)) return min;
+  if (parsed === Infinity) return max;
+  if (parsed === -Infinity) return min;
+
+  return Math.min(Math.max(parsed, min), max);
+}
+
+/**
  * Calculate Staking Yield & APY
  */
 function calculateStakingYield({
@@ -43,10 +78,13 @@ function calculateStakingYield({
   baseApyPercentage = 12,
   enableTierMultiplier = true,
 } = {}) {
-  const P = Math.max(0, Number(depositAmount) || 0);
-  const months = Math.max(1, Number(lockDurationMonths) || 1);
+  // Sanitize defensively as well as at the input boundary: callers passing
+  // `NaN`, `Infinity` or negative values must not poison the results (nor spin
+  // the monthly breakdown loop forever).
+  const P = sanitizeNumericInput(depositAmount, STAKING_INPUT_LIMITS.depositAmount);
+  const months = sanitizeNumericInput(lockDurationMonths, STAKING_INPUT_LIMITS.lockDurationMonths);
   const t = months / 12; // Time in years
-  const baseApy = Math.max(0, Number(baseApyPercentage) || 0);
+  const baseApy = sanitizeNumericInput(baseApyPercentage, STAKING_INPUT_LIMITS.baseApyPercentage);
 
   const multiplier = enableTierMultiplier ? getDurationTierMultiplier(months) : 1.0;
   const effectiveApyPercent = baseApy * multiplier;
@@ -112,6 +150,8 @@ function calculateStakingYield({
 module.exports = {
   calculateStakingYield,
   getDurationTierMultiplier,
+  sanitizeNumericInput,
   COMPOUND_FREQUENCIES,
   DURATION_TIER_MULTIPLIERS,
+  STAKING_INPUT_LIMITS,
 };

@@ -132,6 +132,7 @@ The web dashboard includes an interactive **Token Yield & Staking Calculator Wid
 - **Interactive Parameters**: Sliders and numerical inputs for Deposit Amount, Lock Duration (1-36M), Base APY, Compound Frequency (Daily, Weekly, Monthly, Quarterly, Annually, Simple Interest), and Duration Tier Multiplier toggles.
 - **Real-Time Return Projections**: Computes Projected Total Balance, Total Rewards, Effective APY, ROI %, and Estimated Daily & Monthly Earnings.
 - **Milestone Schedule**: Interactive Monthly Milestone Schedule detailing cumulative yield and balance progression.
+- **Input Guardrails**: Numerical fields enforce their documented bounds and sanitize typed text, so negative, blank, non-numeric or overflowing input (e.g. `-`, `abc`, `1e400`) clamps to a finite in-range value instead of producing `NaN` projections.
 - **Unit Testing**: Tests under `web/lib/stakingCalculator.test.cjs` and `web/components/StakingCalculator.test.cjs`.
 
 ---
