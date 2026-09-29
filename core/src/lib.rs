@@ -10,6 +10,7 @@ pub mod merkle_tree;
 pub mod rpc_provider;
 pub mod runner;
 pub mod simulation;
+pub mod xdr_decoder;
 pub mod wasm_branch_analysis;
 
 #[cfg(test)]

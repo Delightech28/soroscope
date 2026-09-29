@@ -85,6 +85,12 @@ impl From<SimulationError> for AppError {
             SimulationError::XdrError(msg) => {
                 AppError::BadRequest(format!("XDR encoding error: {}", msg))
             }
+            SimulationError::NotSorobanTransaction => {
+                AppError::BadRequest("Transaction is not Soroban-enabled".to_string())
+            }
+            SimulationError::HistoricalTransactionNotFound(hash) => {
+                AppError::NotFound(format!("Historical transaction {hash}"))
+            }
             SimulationError::Base64Error(e) => {
                 AppError::BadRequest(format!("Base64 decode error: {}", e))
             }

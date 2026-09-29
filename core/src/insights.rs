@@ -1,4 +1,4 @@
-use crate::simulation::SorobanResources;
+use crate::simulation::{AuthTreeReport, SorobanResources};
 use serde::{Deserialize, Serialize};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -282,6 +282,29 @@ impl InsightsEngine {
         }
     }
 
+    pub fn analyze_with_auth_tree(
+        &self,
+        resources: &SorobanResources,
+        auth_tree: &AuthTreeReport,
+    ) -> InsightsReport {
+        let mut report = self.analyze(resources);
+        if auth_tree.exceeds_transaction_size_limit {
+            report.insights.push(Insight {
+                severity: Severity::Warning,
+                rule: "auth_tree_size".to_string(),
+                message: format!(
+                    "Authorization bytes ({}) exceed the transaction size limit ({} bytes).",
+                    auth_tree.total_xdr_bytes, auth_tree.transaction_size_limit_bytes
+                ),
+                suggested_fix:
+                    "Reduce the number or depth of authorization entries and sub-invocations."
+                        .to_string(),
+            });
+            report.efficiency_score = Self::compute_efficiency_score(resources, &report.insights);
+        }
+        report
+    }
+
     /// Weighted efficiency score (0–100).
     ///
     /// Starts at 100 and deducts points for:
@@ -359,6 +382,33 @@ mod tests {
         let report = engine.analyze(&minimal_resources());
         assert_eq!(report.efficiency_score, 100);
         assert!(report.insights.is_empty());
+    }
+
+    #[test]
+    fn test_auth_tree_over_limit_emits_auth_bytes_warning() {
+        let engine = InsightsEngine::new();
+        let auth_tree = AuthTreeReport {
+            entry_count: 2,
+            max_depth: 2,
+            credential_kinds: vec![
+                crate::simulation::AuthCredentialKind::Ed25519,
+                crate::simulation::AuthCredentialKind::Contract,
+            ],
+            total_xdr_bytes: 100_001,
+            transaction_size_limit_bytes: 100_000,
+            exceeds_transaction_size_limit: true,
+            auth_cpu_instructions: None,
+        };
+
+        let report = engine.analyze_with_auth_tree(&minimal_resources(), &auth_tree);
+        let insight = report
+            .insights
+            .iter()
+            .find(|insight| insight.rule == "auth_tree_size")
+            .expect("oversized auth tree should produce a warning");
+        assert_eq!(insight.severity, Severity::Warning);
+        assert!(insight.message.contains("Authorization bytes (100001)"));
+        assert!(insight.message.contains("100000 bytes"));
     }
 
     #[test]

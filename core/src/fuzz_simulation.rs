@@ -85,6 +85,7 @@ mod tests {
         )
             .prop_map(|(res, ledger, cost, td)| SimulationResult {
                 resources: res,
+                auth_tree: Default::default(),
                 transaction_hash: None,
                 latest_ledger: ledger,
                 cost_stroops: cost,

@@ -49,6 +49,12 @@ pub enum SimulationError {
     #[error("XDR decode error: {0}")]
     XdrError(String),
 
+    #[error("Transaction is not a Soroban host-function transaction")]
+    NotSorobanTransaction,
+
+    #[error("Historical transaction was not found: {0}")]
+    HistoricalTransactionNotFound(String),
+
     #[error("Invalid contract: {0}")]
     InvalidContract(String),
 
@@ -126,6 +132,50 @@ pub struct ProfileResult {
     /// "instrumented" when binary-level counters were used; "budget" when
     /// falling back to the soroban-sdk budget API.
     pub granularity: String,
+    /// CPU and memory totals for special exports and the selected guarded function.
+    #[serde(default)]
+    pub function_resources: HashMap<String, FunctionResourceUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FunctionResourceUsage {
+    pub cpu_instructions: u64,
+    pub memory_bytes: u64,
+}
+
+/// Estimated resources and ledger writes for uploading and instantiating a contract.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct DeployProfile {
+    pub wasm_size_bytes: u64,
+    pub code_entry_write_bytes: u64,
+    pub instance_entry_write_bytes: u64,
+    pub install_cpu_instructions: u64,
+    pub install_ram_bytes: u64,
+    pub resource_fee_stroops: u64,
+}
+
+/// Difference summary for upgrading a contract to a new WASM blob.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct UpgradeProfile {
+    pub previous_wasm_size_bytes: u64,
+    pub new_wasm_size_bytes: u64,
+    pub bytes_added: u64,
+    pub bytes_removed: u64,
+    pub code_entry_rewritten_in_full: bool,
+    pub deploy: DeployProfile,
+}
+
+/// Match the local fee formula used by simulation results.
+pub fn estimate_resource_fee_stroops(resources: &SorobanResources) -> u64 {
+    let cpu_cost = resources.cpu_instructions / 10_000;
+    let ram_cost = resources.ram_bytes / 1_024;
+    let ledger_bytes = resources
+        .ledger_read_bytes
+        .saturating_add(resources.ledger_write_bytes);
+    let ledger_cost = ledger_bytes / 1_024;
+    cpu_cost
+        .saturating_add(ram_cost)
+        .saturating_add(ledger_cost)
 }
 
 // ── WasmInstrumenter ─────────────────────────────────────────────────────────
@@ -808,6 +858,8 @@ pub struct OptimizationReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationResult {
     pub resources: SorobanResources,
+    #[serde(default)]
+    pub auth_tree: AuthTreeReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction_hash: Option<String>,
     pub latest_ledger: u64,
@@ -828,6 +880,21 @@ pub struct SimulationResult {
     pub protocol_version: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HistoricalReplayReport {
+    pub transaction_hash: String,
+    pub invocation: Option<crate::xdr_decoder::DecodedInvocation>,
+    pub replay_source: crate::xdr_decoder::ReplaySource,
+    pub original_fee_breakdown: crate::xdr_decoder::ResourceFeeBreakdown,
+    pub new_resources: SorobanResources,
+    pub new_cost_stroops: u64,
+    pub auth_tree: AuthTreeReport,
+    pub original_meta_version: u32,
+    pub skipped_operation_count: usize,
+    pub original_protocol_version: Option<u32>,
+    pub replay_protocol_version: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallNode {
     pub contract_id: String,
@@ -838,6 +905,93 @@ pub struct CallNode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallGraph {
     pub root: CallNode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct NetworkLimits {
+    pub max_transaction_size_bytes: u64,
+}
+
+impl Default for NetworkLimits {
+    fn default() -> Self {
+        Self {
+            max_transaction_size_bytes: 100_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub enum AuthCredentialKind {
+    SourceAccount,
+    Ed25519,
+    Contract,
+    Other,
+}
+
+/// A credential-free summary of Soroban authorization entries.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct AuthTreeReport {
+    pub entry_count: usize,
+    pub max_depth: usize,
+    pub credential_kinds: Vec<AuthCredentialKind>,
+    pub total_xdr_bytes: u64,
+    pub transaction_size_limit_bytes: u64,
+    pub exceeds_transaction_size_limit: bool,
+    /// Omitted unless a local host budget can isolate authorization CPU.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub auth_cpu_instructions: Option<u64>,
+}
+
+impl Default for AuthTreeReport {
+    fn default() -> Self {
+        Self::summarize(&[], NetworkLimits::default()).expect("empty auth tree is valid")
+    }
+}
+
+impl AuthTreeReport {
+    pub fn summarize(
+        entries: &[SorobanAuthorizationEntry],
+        limits: NetworkLimits,
+    ) -> Result<Self, SimulationError> {
+        let mut total_xdr_bytes = 0u64;
+        let mut max_depth = 0;
+        let mut credential_kinds = Vec::with_capacity(entries.len());
+
+        for entry in entries {
+            let xdr = entry
+                .to_xdr(Limits::none())
+                .map_err(|error| SimulationError::XdrError(error.to_string()))?;
+            total_xdr_bytes = total_xdr_bytes.saturating_add(xdr.len() as u64);
+            max_depth = max_depth.max(auth_invocation_depth(&entry.root_invocation));
+            credential_kinds.push(match &entry.credentials {
+                SorobanCredentials::SourceAccount => AuthCredentialKind::SourceAccount,
+                SorobanCredentials::Address(credentials) => match &credentials.address {
+                    ScAddress::Account(_) => AuthCredentialKind::Ed25519,
+                    ScAddress::Contract(_) => AuthCredentialKind::Contract,
+                    _ => AuthCredentialKind::Other,
+                },
+            });
+        }
+
+        Ok(Self {
+            entry_count: entries.len(),
+            max_depth,
+            credential_kinds,
+            total_xdr_bytes,
+            transaction_size_limit_bytes: limits.max_transaction_size_bytes,
+            exceeds_transaction_size_limit: total_xdr_bytes > limits.max_transaction_size_bytes,
+            auth_cpu_instructions: None,
+        })
+    }
+}
+
+fn auth_invocation_depth(invocation: &SorobanAuthorizedInvocation) -> usize {
+    1 + invocation
+        .sub_invocations
+        .iter()
+        .map(auth_invocation_depth)
+        .max()
+        .unwrap_or(0)
 }
 
 impl CallGraph {
@@ -1404,6 +1558,124 @@ impl SimulationEngine {
 
         let transaction_xdr = self.create_invoke_transaction(contract_id, function_name, args)?;
         self.simulate_transaction(&transaction_xdr).await
+    }
+
+    /// Re-simulate the first Soroban host-function operation from a historical transaction.
+    pub async fn reprofile_historical_transaction(
+        &self,
+        transaction_hash: &str,
+    ) -> Result<HistoricalReplayReport, SimulationError> {
+        let (envelope_xdr, result_xdr, result_meta_xdr) =
+            self.fetch_historical_transaction(transaction_hash).await?;
+        let envelope_bytes = BASE64.decode(envelope_xdr)?;
+        let result_bytes = BASE64.decode(result_xdr)?;
+        let result_meta_bytes = BASE64.decode(result_meta_xdr)?;
+        let decoded = crate::xdr_decoder::decode_historical_transaction(
+            &envelope_bytes,
+            &result_bytes,
+            &result_meta_bytes,
+        )?;
+        let transaction_xdr = self.build_host_function_transaction(
+            decoded.host_function.clone(),
+            decoded.auth_entries.clone(),
+            decoded.soroban_transaction_data.clone(),
+        )?;
+        let replay = self.simulate_transaction(&transaction_xdr).await?;
+
+        Ok(HistoricalReplayReport {
+            transaction_hash: transaction_hash.to_string(),
+            invocation: decoded.invocation,
+            replay_source: decoded.replay_source,
+            original_fee_breakdown: decoded.resource_fee_breakdown,
+            new_resources: replay.resources,
+            new_cost_stroops: replay.cost_stroops,
+            auth_tree: AuthTreeReport::summarize(
+                &decoded.auth_entries,
+                NetworkLimits::default(),
+            )?,
+            original_meta_version: decoded.original_meta_version,
+            skipped_operation_count: decoded.skipped_operation_count,
+            original_protocol_version: None,
+            replay_protocol_version: (replay.protocol_version != 0)
+                .then_some(replay.protocol_version),
+        })
+    }
+
+    async fn fetch_historical_transaction(
+        &self,
+        transaction_hash: &str,
+    ) -> Result<(String, String, String), SimulationError> {
+        let (url, auth_header, auth_value) = match &self.registry {
+            Some(registry) => {
+                let provider = registry
+                    .healthy_providers()
+                    .await
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        SimulationError::RpcRequestFailed("No healthy providers".to_string())
+                    })?;
+                (
+                    provider.url.clone(),
+                    provider.auth_header.clone(),
+                    provider.auth_value.clone(),
+                )
+            }
+            None => (self.rpc_url.clone(), None, None),
+        };
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": { "hash": transaction_hash },
+        });
+        let mut builder = self.client.post(&url).json(&request);
+        if let (Some(header), Some(value)) = (auth_header.as_deref(), auth_value.as_deref()) {
+            builder = builder.header(header, value);
+        }
+        let response = tokio::time::timeout(self.request_timeout, builder.send())
+            .await
+            .map_err(|_| SimulationError::NodeTimeout)?
+            .map_err(|error| SimulationError::RpcRequestFailed(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(SimulationError::RpcRequestFailed(format!(
+                "HTTP error: {}",
+                response.status()
+            )));
+        }
+        let payload: serde_json::Value = response.json().await.map_err(|error| {
+            SimulationError::RpcRequestFailed(format!("Failed to parse getTransaction: {error}"))
+        })?;
+        if let Some(error) = payload.get("error") {
+            return Err(SimulationError::RpcRequestFailed(format!(
+                "getTransaction RPC error: {}",
+                error
+            )));
+        }
+        let result = payload.get("result").ok_or_else(|| {
+            SimulationError::RpcRequestFailed("Missing getTransaction result".to_string())
+        })?;
+        if result.get("status").and_then(serde_json::Value::as_str) == Some("NOT_FOUND") {
+            return Err(SimulationError::HistoricalTransactionNotFound(
+                transaction_hash.to_string(),
+            ));
+        }
+        let get_xdr = |field: &str| {
+            result
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    SimulationError::RpcRequestFailed(format!(
+                        "getTransaction response omitted {field}"
+                    ))
+                })
+        };
+        Ok((
+            get_xdr("envelopeXdr")?,
+            get_xdr("resultXdr")?,
+            get_xdr("resultMetaXdr")?,
+        ))
     }
 
     /// Optimized limit discovery via binary search
@@ -2556,6 +2828,7 @@ impl SimulationEngine {
         let cost_stroops = self.calculate_cost(&resources);
         Ok(SimulationResult {
             resources,
+            auth_tree: AuthTreeReport::default(),
             transaction_hash: None,
             latest_ledger: rpc_result.latest_ledger,
             cost_stroops,
@@ -2658,15 +2931,7 @@ impl SimulationEngine {
     }
 
     pub(crate) fn calculate_cost(&self, resources: &SorobanResources) -> u64 {
-        let cpu_cost = resources.cpu_instructions / 10000;
-        let ram_cost = resources.ram_bytes / 1024;
-        let ledger_bytes = resources
-            .ledger_read_bytes
-            .saturating_add(resources.ledger_write_bytes);
-        let ledger_cost = ledger_bytes / 1024;
-        cpu_cost
-            .saturating_add(ram_cost)
-            .saturating_add(ledger_cost)
+        estimate_resource_fee_stroops(resources)
     }
 
     /// Create invoke transaction for contract call
@@ -2702,6 +2967,15 @@ impl SimulationEngine {
         host_function: HostFunction,
         auth: Vec<SorobanAuthorizationEntry>,
     ) -> Result<String, SimulationError> {
+        self.build_host_function_transaction(host_function, auth, None)
+    }
+
+    fn build_host_function_transaction(
+        &self,
+        host_function: HostFunction,
+        auth: Vec<SorobanAuthorizationEntry>,
+        soroban_data: Option<SorobanTransactionData>,
+    ) -> Result<String, SimulationError> {
         let invoke_op = InvokeHostFunctionOp {
             host_function,
             auth: auth
@@ -2722,7 +2996,9 @@ impl SimulationEngine {
             operations: vec![operation].try_into().map_err(|_| {
                 SimulationError::XdrError("Failed to create operations".to_string())
             })?,
-            ext: TransactionExt::V0,
+            ext: soroban_data
+                .map(TransactionExt::V1)
+                .unwrap_or(TransactionExt::V0),
         };
         let envelope = TransactionV1Envelope {
             tx: transaction,
@@ -2906,6 +3182,7 @@ impl SimulationEngine {
             network_passphrase,
             expiration_ledger,
         )?;
+        let auth_tree = AuthTreeReport::summarize(&auth_entries, NetworkLimits::default())?;
 
         tracing::info!(
             signers = signers.len(),
@@ -2921,7 +3198,9 @@ impl SimulationEngine {
 
         let transaction_xdr =
             self.build_invoke_host_function_transaction(host_function, auth_entries)?;
-        self.simulate_transaction(&transaction_xdr).await
+        let mut result = self.simulate_transaction(&transaction_xdr).await?;
+        result.auth_tree = auth_tree;
+        Ok(result)
     }
 
     /// Build a `SorobanAuthorizedInvocation` for the given contract call.
@@ -3129,6 +3408,200 @@ pub fn profile_contract(
     })
 }
 
+/// Profile the local host work and estimated ledger writes for a fresh deploy.
+pub fn profile_contract_deploy(wasm_bytes: Vec<u8>) -> Result<DeployProfile, SimulationError> {
+    validate_deploy_wasm(&wasm_bytes)?;
+
+    use soroban_sdk::Env;
+
+    let env = Env::default();
+    env.cost_estimate().budget().reset_unlimited();
+    let start_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let start_mem = env.cost_estimate().budget().memory_bytes_cost();
+    let install_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.register(&*wasm_bytes, ())
+    }));
+    if install_result.is_err() {
+        return Err(SimulationError::InvalidContract(
+            "WASM could not be installed in the local Soroban host".to_string(),
+        ));
+    }
+
+    let install_cpu_instructions = env
+        .cost_estimate()
+        .budget()
+        .cpu_instruction_cost()
+        .saturating_sub(start_cpu);
+    let install_ram_bytes = env
+        .cost_estimate()
+        .budget()
+        .memory_bytes_cost()
+        .saturating_sub(start_mem);
+    let wasm_size_bytes = wasm_bytes.len() as u64;
+    let code_entry_write_bytes = wasm_size_bytes.saturating_add(52).saturating_add(3) & !3;
+    let instance_entry_write_bytes = 160;
+    let resources = SorobanResources {
+        cpu_instructions: install_cpu_instructions,
+        ram_bytes: install_ram_bytes,
+        ledger_read_bytes: 0,
+        ledger_write_bytes: code_entry_write_bytes.saturating_add(instance_entry_write_bytes),
+        transaction_size_bytes: wasm_size_bytes,
+    };
+
+    Ok(DeployProfile {
+        wasm_size_bytes,
+        code_entry_write_bytes,
+        instance_entry_write_bytes,
+        install_cpu_instructions,
+        install_ram_bytes,
+        resource_fee_stroops: estimate_resource_fee_stroops(&resources),
+    })
+}
+
+/// Compare old and new WASM blobs, pricing the new blob as a full code-entry write.
+pub fn profile_contract_upgrade(
+    previous_wasm: Vec<u8>,
+    new_wasm: Vec<u8>,
+) -> Result<UpgradeProfile, SimulationError> {
+    validate_deploy_wasm(&previous_wasm)?;
+    validate_deploy_wasm(&new_wasm)?;
+
+    let common_prefix_len = previous_wasm
+        .iter()
+        .zip(&new_wasm)
+        .take_while(|(previous, new)| previous == new)
+        .count();
+    let remaining_previous = &previous_wasm[common_prefix_len..];
+    let remaining_new = &new_wasm[common_prefix_len..];
+    let common_suffix_len = remaining_previous
+        .iter()
+        .rev()
+        .zip(remaining_new.iter().rev())
+        .take_while(|(previous, new)| previous == new)
+        .count();
+    let bytes_removed = (remaining_previous.len() - common_suffix_len) as u64;
+    let bytes_added = (remaining_new.len() - common_suffix_len) as u64;
+    let previous_wasm_size_bytes = previous_wasm.len() as u64;
+    let new_wasm_size_bytes = new_wasm.len() as u64;
+    let deploy = profile_contract_deploy(new_wasm)?;
+
+    Ok(UpgradeProfile {
+        previous_wasm_size_bytes,
+        new_wasm_size_bytes,
+        bytes_added,
+        bytes_removed,
+        code_entry_rewritten_in_full: true,
+        deploy,
+    })
+}
+
+fn validate_deploy_wasm(wasm_bytes: &[u8]) -> Result<(), SimulationError> {
+    if wasm_bytes.is_empty() {
+        return Err(SimulationError::InvalidContract(
+            "WASM input must not be empty".to_string(),
+        ));
+    }
+    wasmparser::Validator::new()
+        .validate_all(wasm_bytes)
+        .map_err(|error| SimulationError::InvalidContract(format!("Invalid WASM: {error}")))?;
+    Ok(())
+}
+
+fn profile_constructor_budget(wasm_bytes: &[u8]) -> Result<FunctionResourceUsage, SimulationError> {
+    use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let wasm_hash = env
+        .deployer()
+        .upload_contract_wasm(Bytes::from_slice(&env, wasm_bytes));
+    let deployer = env
+        .deployer()
+        .with_address(Address::generate(&env), BytesN::from_array(&env, &[0; 32]));
+
+    env.cost_estimate().budget().reset_unlimited();
+    let start_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let start_mem = env.cost_estimate().budget().memory_bytes_cost();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deployer.deploy_v2(wasm_hash, ())
+    }));
+    if result.is_err() {
+        return Err(SimulationError::InvalidContract(
+            "Contract constructor failed during profiling".to_string(),
+        ));
+    }
+
+    Ok(FunctionResourceUsage {
+        cpu_instructions: env
+            .cost_estimate()
+            .budget()
+            .cpu_instruction_cost()
+            .saturating_sub(start_cpu),
+        memory_bytes: env
+            .cost_estimate()
+            .budget()
+            .memory_bytes_cost()
+            .saturating_sub(start_mem),
+    })
+}
+
+fn profile_check_auth_budget(
+    wasm_bytes: &[u8],
+    guarded_function: &str,
+    args: &[String],
+) -> Result<FunctionResourceUsage, SimulationError> {
+    use soroban_sdk::auth::{Context, ContractContext};
+    use soroban_sdk::{BytesN, Env, IntoVal, Symbol, Val};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(wasm_bytes, ());
+    let mut sdk_args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
+    for arg in args {
+        sdk_args.push_back(local_parse_arg(&env, arg));
+    }
+    let auth_context = soroban_sdk::vec![
+        &env,
+        Context::Contract(ContractContext {
+            contract: contract_id.clone(),
+            fn_name: Symbol::new(&env, guarded_function),
+            args: sdk_args,
+        }),
+    ];
+    let signature_payload = BytesN::from_array(&env, &[0; 32]);
+    let signature: Val = ().into_val(&env);
+
+    env.cost_estimate().budget().reset_unlimited();
+    let start_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let start_mem = env.cost_estimate().budget().memory_bytes_cost();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.try_invoke_contract_check_auth::<soroban_sdk::InvokeError>(
+            &contract_id,
+            &signature_payload,
+            signature,
+            &auth_context,
+        )
+    }));
+    if result.is_err() {
+        return Err(SimulationError::InvalidContract(
+            "Custom account check_auth panicked during profiling".to_string(),
+        ));
+    }
+
+    Ok(FunctionResourceUsage {
+        cpu_instructions: env
+            .cost_estimate()
+            .budget()
+            .cpu_instruction_cost()
+            .saturating_sub(start_cpu),
+        memory_bytes: env
+            .cost_estimate()
+            .budget()
+            .memory_bytes_cost()
+            .saturating_sub(start_mem),
+    })
+}
+
 /// Convert a string argument to a `soroban_sdk::Val` for local invocation.
 ///
 /// Supports: `void`/`()`, `true`/`false`, integers, and falls back to Symbol.
@@ -3181,30 +3654,51 @@ pub fn profile_contract_with_flamegraph(
     let _enter = span.enter();
 
     // ── Attempt binary instrumentation ───────────────────────────────────────
-    let (instrumented, func_names, use_budget_fallback) = match WasmInstrumenter::new(&wasm_bytes) {
-        Ok(instrumenter) => match instrumenter.instrument(&wasm_bytes) {
-            Ok(bytes) => {
-                let names = instrumenter.func_names().to_vec();
-                (bytes, names, false)
+    let (instrumented, func_names, use_budget_fallback, has_constructor, has_check_auth) =
+        match WasmInstrumenter::new(&wasm_bytes) {
+            Ok(instrumenter) => {
+                let has_constructor = instrumenter.export_map().contains_key("__constructor");
+                let has_check_auth = instrumenter.export_map().contains_key("__check_auth");
+                if has_constructor || has_check_auth {
+                    // The special exports have host-defined argument ABIs; execute
+                    // the original module for those budget lines instead of adding
+                    // zero-argument wrappers around them.
+                    (
+                        wasm_bytes.clone(),
+                        vec![],
+                        true,
+                        has_constructor,
+                        has_check_auth,
+                    )
+                } else {
+                    match instrumenter.instrument(&wasm_bytes) {
+                        Ok(bytes) => (
+                            bytes,
+                            instrumenter.func_names().to_vec(),
+                            false,
+                            false,
+                            false,
+                        ),
+                        Err(error) => {
+                            tracing::error!(
+                                wasm_size_bytes = wasm_size,
+                                error = %error,
+                                "WASM instrumentation failed; falling back to budget API"
+                            );
+                            (wasm_bytes.clone(), vec![], true, false, false)
+                        }
+                    }
+                }
             }
-            Err(e) => {
+            Err(error) => {
                 tracing::error!(
                     wasm_size_bytes = wasm_size,
-                    error = %e,
+                    error = %error,
                     "WASM instrumentation failed; falling back to budget API"
                 );
-                (wasm_bytes.clone(), vec![], true)
+                (wasm_bytes.clone(), vec![], true, false, false)
             }
-        },
-        Err(e) => {
-            tracing::error!(
-                wasm_size_bytes = wasm_size,
-                error = %e,
-                "WASM instrumentation failed; falling back to budget API"
-            );
-            (wasm_bytes.clone(), vec![], true)
-        }
-    };
+        };
 
     // ── Execute in soroban-sdk Env ────────────────────────────────────────────
     let env = Env::default();
@@ -3281,7 +3775,7 @@ pub fn profile_contract_with_flamegraph(
     };
 
     // ── Collect per-function counts ───────────────────────────────────────────
-    let (per_function, granularity) = if use_budget_fallback || !use_wrapper {
+    let (mut per_function, mut granularity) = if use_budget_fallback || !use_wrapper {
         // Budget fallback: single aggregate entry under the function name
         let mut map = HashMap::new();
         map.insert(function_name.clone(), resources.cpu_instructions);
@@ -3297,6 +3791,32 @@ pub fn profile_contract_with_flamegraph(
         map.insert(function_name.clone(), count);
         (map, "instrumented".to_string())
     };
+
+    let mut function_resources = HashMap::new();
+    if has_constructor || has_check_auth {
+        per_function.clear();
+        per_function.insert(function_name.clone(), resources.cpu_instructions);
+        function_resources.insert(
+            function_name.clone(),
+            FunctionResourceUsage {
+                cpu_instructions: resources.cpu_instructions,
+                memory_bytes: resources.ram_bytes,
+            },
+        );
+
+        if has_constructor {
+            let usage = profile_constructor_budget(&wasm_bytes)?;
+            per_function.insert("constructor".to_string(), usage.cpu_instructions);
+            function_resources.insert("constructor".to_string(), usage);
+        }
+
+        if has_check_auth {
+            let usage = profile_check_auth_budget(&wasm_bytes, &function_name, &args)?;
+            per_function.insert("check_auth".to_string(), usage.cpu_instructions);
+            function_resources.insert("check_auth".to_string(), usage);
+        }
+        granularity = "budget".to_string();
+    }
 
     let total_instructions: u64 = per_function.values().sum();
 
@@ -3321,6 +3841,7 @@ pub fn profile_contract_with_flamegraph(
             per_function,
             total_instructions,
             granularity,
+            function_resources,
         },
     ))
 }
@@ -3335,6 +3856,157 @@ pub fn profile_contract_with_flamegraph(
 mod tests {
     use super::*;
     use crate::cache::SimulationCache;
+
+    fn auth_invocation() -> SorobanAuthorizedInvocation {
+        SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: ScAddress::Contract(Hash([3; 32])),
+                function_name: "call".try_into().unwrap(),
+                args: VecM::default(),
+            }),
+            sub_invocations: VecM::default(),
+        }
+    }
+
+    fn auth_entry(
+        invocation: SorobanAuthorizedInvocation,
+        credential_kind: AuthCredentialKind,
+    ) -> SorobanAuthorizationEntry {
+        let credentials = match credential_kind {
+            AuthCredentialKind::SourceAccount => SorobanCredentials::SourceAccount,
+            AuthCredentialKind::Ed25519 => SorobanCredentials::Address(SorobanAddressCredentials {
+                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [7; 32],
+                )))),
+                nonce: 9,
+                signature_expiration_ledger: 100,
+                signature: ScVal::Bytes(vec![0xA5; 64].try_into().unwrap()),
+            }),
+            AuthCredentialKind::Contract | AuthCredentialKind::Other => {
+                panic!("test fixture only constructs ed25519/source credentials")
+            }
+        };
+        SorobanAuthorizationEntry {
+            credentials,
+            root_invocation: invocation,
+        }
+    }
+
+    #[test]
+    fn test_auth_tree_report_empty_and_fixed_ed25519_xdr_size() {
+        let empty = AuthTreeReport::summarize(&[], NetworkLimits::default()).unwrap();
+        assert_eq!(empty.entry_count, 0);
+        assert_eq!(empty.max_depth, 0);
+        assert_eq!(empty.total_xdr_bytes, 0);
+        assert!(empty.credential_kinds.is_empty());
+        assert!(!empty.exceeds_transaction_size_limit);
+        assert_eq!(empty.auth_cpu_instructions, None);
+
+        let entry = auth_entry(auth_invocation(), AuthCredentialKind::Ed25519);
+        let report = AuthTreeReport::summarize(&[entry.clone()], NetworkLimits::default()).unwrap();
+        let repeated = AuthTreeReport::summarize(&[entry], NetworkLimits::default()).unwrap();
+        assert_eq!(report.entry_count, 1);
+        assert_eq!(report.max_depth, 1);
+        assert_eq!(report.credential_kinds, vec![AuthCredentialKind::Ed25519]);
+        assert_eq!(report.total_xdr_bytes, 184);
+        assert_eq!(report.total_xdr_bytes, repeated.total_xdr_bytes);
+    }
+
+    #[test]
+    fn test_auth_tree_report_counts_entries_and_nested_invocation_depth() {
+        let mut nested = auth_invocation();
+        nested.sub_invocations = vec![auth_invocation()].try_into().unwrap();
+        let entries = [
+            auth_entry(nested, AuthCredentialKind::Ed25519),
+            auth_entry(auth_invocation(), AuthCredentialKind::SourceAccount),
+        ];
+
+        let report = AuthTreeReport::summarize(&entries, NetworkLimits::default()).unwrap();
+        assert_eq!(report.entry_count, 2);
+        assert_eq!(report.max_depth, 2);
+        assert_eq!(
+            report.credential_kinds,
+            vec![
+                AuthCredentialKind::Ed25519,
+                AuthCredentialKind::SourceAccount
+            ]
+        );
+        assert_eq!(report.total_xdr_bytes, 300);
+    }
+
+    #[test]
+    fn test_auth_tree_report_does_not_serialize_signature_material() {
+        let report = AuthTreeReport::summarize(
+            &[auth_entry(auth_invocation(), AuthCredentialKind::Ed25519)],
+            NetworkLimits::default(),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("signature"));
+        assert!(!json.contains("165,165,165"));
+    }
+
+    fn deploy_fixture(padding_bytes: usize) -> Vec<u8> {
+        let mut wasm = soroban_wasm();
+        let section_name = b"issue1002";
+        let section_size = section_name.len() + 1 + padding_bytes;
+        wasm.push(0);
+        let mut remaining = section_size as u32;
+        while remaining >= 0x80 {
+            wasm.push((remaining as u8) | 0x80);
+            remaining >>= 7;
+        }
+        wasm.push(remaining as u8);
+        wasm.push(section_name.len() as u8);
+        wasm.extend_from_slice(section_name);
+        wasm.resize(wasm.len() + padding_bytes, 0);
+        wasm
+    }
+
+    #[test]
+    fn test_deploy_profile_prices_known_wasm_fixture_sizes() {
+        let smaller_wasm = deploy_fixture(1_024);
+        let larger_wasm = deploy_fixture(2_048);
+        assert_eq!(larger_wasm.len() - smaller_wasm.len(), 1_024);
+
+        let smaller = profile_contract_deploy(smaller_wasm).unwrap();
+        let larger = profile_contract_deploy(larger_wasm).unwrap();
+
+        assert_eq!(
+            (smaller.wasm_size_bytes + 55) & !3,
+            smaller.code_entry_write_bytes
+        );
+        assert_eq!(smaller.instance_entry_write_bytes, 160);
+        assert!(larger.resource_fee_stroops > smaller.resource_fee_stroops);
+    }
+
+    #[test]
+    fn test_upgrade_profile_diffs_and_prices_full_new_blob() {
+        let smaller_wasm = deploy_fixture(1_024);
+        let larger_wasm = deploy_fixture(2_048);
+        let larger_deploy = profile_contract_deploy(larger_wasm.clone()).unwrap();
+        let upgrade = profile_contract_upgrade(smaller_wasm, larger_wasm).unwrap();
+
+        assert!(upgrade.bytes_added > 0);
+        assert!(upgrade.bytes_removed > 0);
+        assert!(upgrade.code_entry_rewritten_in_full);
+        assert_eq!(upgrade.deploy, larger_deploy);
+        assert_eq!(upgrade.deploy.wasm_size_bytes, upgrade.new_wasm_size_bytes);
+    }
+
+    #[test]
+    fn test_deploy_and_upgrade_reject_empty_or_non_wasm_before_pricing() {
+        for invalid in [Vec::new(), b"not wasm".to_vec()] {
+            assert!(matches!(
+                profile_contract_deploy(invalid.clone()),
+                Err(SimulationError::InvalidContract(_))
+            ));
+            assert!(matches!(
+                profile_contract_upgrade(deploy_fixture(1), invalid),
+                Err(SimulationError::InvalidContract(_))
+            ));
+        }
+    }
 
     #[test]
     fn test_soroban_resources_default() {
@@ -3469,6 +4141,7 @@ mod tests {
                 ledger_write_bytes: 20,
                 transaction_size_bytes: 30,
             },
+            auth_tree: AuthTreeReport::default(),
             transaction_hash: None,
             latest_ledger: 1000,
             cost_stroops: 1,
@@ -3501,6 +4174,7 @@ mod tests {
                 ledger_write_bytes: 20,
                 transaction_size_bytes: 30,
             },
+            auth_tree: AuthTreeReport::default(),
             transaction_hash: None,
             latest_ledger: 1000,
             cost_stroops: 1,
@@ -3852,6 +4526,7 @@ mod tests {
                     ledger_write_bytes: 256,
                     transaction_size_bytes: 128,
                 },
+                auth_tree: AuthTreeReport::default(),
                 transaction_hash: None,
                 latest_ledger: 42,
                 cost_stroops: 10,
@@ -4197,6 +4872,55 @@ mod tests {
         module.finish()
     }
 
+    fn soroban_wasm_with_special_exports() -> Vec<u8> {
+        use soroban_sdk::xdr::{Limits, ScEnvMetaEntry, ScEnvMetaEntryInterfaceVersion, WriteXdr};
+        use wasm_encoder::{
+            CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
+            Module, TypeSection, ValType,
+        };
+
+        let meta_entry =
+            ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(ScEnvMetaEntryInterfaceVersion {
+                protocol: 22,
+                pre_release: 0,
+            });
+        let meta_bytes = meta_entry.to_xdr(Limits::none()).unwrap();
+        let mut module = Module::new();
+        module.section(&CustomSection {
+            name: "contractenvmetav0".into(),
+            data: meta_bytes.as_slice().into(),
+        });
+
+        let mut types = TypeSection::new();
+        types.ty().function([], [ValType::I64]);
+        types
+            .ty()
+            .function([ValType::I64, ValType::I64, ValType::I64], [ValType::I64]);
+        module.section(&types);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        functions.function(1);
+        functions.function(0);
+        module.section(&functions);
+
+        let mut exports = ExportSection::new();
+        exports.export("__constructor", ExportKind::Func, 0);
+        exports.export("__check_auth", ExportKind::Func, 1);
+        exports.export("guarded", ExportKind::Func, 2);
+        module.section(&exports);
+
+        let mut code = CodeSection::new();
+        for _ in 0..3 {
+            let mut function = Function::new(vec![]);
+            function.instruction(&wasm_encoder::Instruction::I64Const(2));
+            function.instruction(&wasm_encoder::Instruction::End);
+            code.function(&function);
+        }
+        module.section(&code);
+        module.finish()
+    }
+
     #[test]
     fn test_wasm_instrumenter_new_valid() {
         let wasm = minimal_wasm();
@@ -4288,6 +5012,7 @@ mod tests {
             per_function,
             total_instructions: 2000,
             granularity: "instrumented".to_string(),
+            function_resources: HashMap::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: ProfileResult = serde_json::from_str(&json).unwrap();
@@ -4301,6 +5026,7 @@ mod tests {
             per_function: HashMap::new(),
             total_instructions: 0,
             granularity: "budget".to_string(),
+            function_resources: HashMap::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"flamegraph\""));
@@ -4316,6 +5042,7 @@ mod tests {
             per_function: HashMap::new(),
             total_instructions: 0,
             granularity: "instrumented".to_string(),
+            function_resources: HashMap::new(),
         };
         assert_eq!(result.total_instructions, 0);
         assert_eq!(result.flamegraph, "");
@@ -4349,6 +5076,34 @@ mod tests {
             "total_instructions should be > 0"
         );
         assert_eq!(profile.granularity, "instrumented");
+        assert_eq!(profile.per_function.len(), 1);
+        assert!(!profile.per_function.contains_key("constructor"));
+        assert!(!profile.per_function.contains_key("check_auth"));
+        assert!(profile.function_resources.is_empty());
+    }
+
+    #[test]
+    fn test_profile_special_exports_as_independent_budget_lines() {
+        let wasm = soroban_wasm_with_special_exports();
+        let (resources, profile) =
+            profile_contract_with_flamegraph(wasm, "guarded".to_string(), vec![])
+                .expect("special exports should be profiled");
+
+        assert_eq!(profile.granularity, "budget");
+        assert_eq!(profile.per_function.len(), 3);
+        assert!(profile.per_function.contains_key("constructor"));
+        assert!(profile.per_function.contains_key("check_auth"));
+        assert!(profile.per_function.contains_key("guarded"));
+        assert_eq!(
+            profile.total_instructions,
+            profile.per_function.values().sum()
+        );
+        assert_eq!(profile.per_function["guarded"], resources.cpu_instructions);
+        for name in ["constructor", "check_auth", "guarded"] {
+            let usage = &profile.function_resources[name];
+            assert!(usage.cpu_instructions > 0, "{name} CPU should be measured");
+            assert!(usage.memory_bytes > 0, "{name} memory should be measured");
+        }
     }
 
     #[test]
@@ -4373,6 +5128,7 @@ mod tests {
             per_function: HashMap::new(),
             total_instructions: 0,
             granularity: "instrumented".to_string(),
+            function_resources: HashMap::new(),
         };
         assert_eq!(result.total_instructions, 0);
         assert_eq!(result.flamegraph, "");
