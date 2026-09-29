@@ -848,6 +848,7 @@ mod tests {
         let resolved = usdc_request().resolve(balances()).unwrap();
         let report = SacTransferReport {
             simulation: SimulationResult {
+                bytes_by_durability: crate::simulation::BytesByDurability::default(),
                 resources: Default::default(),
                 transaction_hash: None,
                 latest_ledger: 42,

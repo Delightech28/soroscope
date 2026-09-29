@@ -137,6 +137,34 @@ impl SorobanFeeConfig {
             self.temporary_rent_rate_denominator,
         )
     }
+
+    /// Estimate rent for one entry over the requested number of ledgers.
+    pub fn estimate_entry_rent_stroops(
+        &self,
+        entry_size_bytes: u64,
+        ledgers: u32,
+        temporary: bool,
+    ) -> u64 {
+        let divisor = if temporary {
+            self.temporary_rent_divisor()
+        } else {
+            self.persistent_rent_divisor()
+        };
+        rent_fee(
+            entry_size_bytes.saturating_mul(ledgers as u64),
+            self.fee_per_write_1kb,
+            divisor,
+        )
+    }
+
+    /// Estimate the resource write fee for restoring one entry.
+    pub fn estimate_restore_write_stroops(&self, entry_size_bytes: u64) -> u64 {
+        (self.fee_per_write_entry.max(0) as u64).saturating_add(fee_per_increment(
+            entry_size_bytes as u128,
+            self.fee_per_write_1kb.max(0) as u128,
+            self.data_size_1kb_increment.max(1) as u128,
+        ))
+    }
 }
 
 /// `ceil(numerator / denominator)` in `u128` space, saturating to `u64::MAX`.

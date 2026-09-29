@@ -92,8 +92,10 @@ export interface StateDependencyReport {
 
 export interface TtlEntryApiReport {
   key: string;
+  key_kind: 'code' | 'instance' | 'persistent' | 'temporary' | 'other';
   live_until_ledger: number;
   remaining_ledgers: number;
+  entry_xdr_size_bytes: number | null;
 }
 
 export interface ExtendTtlSuggestionApi {
@@ -102,6 +104,22 @@ export interface ExtendTtlSuggestionApi {
   remaining_ledgers: number;
   extend_to_ledger: number;
   ledgers_to_extend_by: number;
+  entry_xdr_size_bytes: number | null;
+  estimated_rent_stroops: number | null;
+  estimated_instructions: number;
+  estimated_transaction_size_bytes: number;
+  suggested_operation: string;
+}
+
+export interface RestoreTtlSuggestionApi {
+  key: string;
+  current_live_until_ledger: number;
+  remaining_ledgers: number;
+  restore_to_ledger: number;
+  ledgers_to_restore_for: number;
+  entry_xdr_size_bytes: number | null;
+  estimated_rent_stroops: number | null;
+  estimated_write_stroops: number | null;
   suggested_operation: string;
 }
 
@@ -109,6 +127,28 @@ export interface TtlAnalysisApiReport {
   current_ledger: number;
   touched_entries: TtlEntryApiReport[];
   extend_ttl_suggestions: ExtendTtlSuggestionApi[];
+  restore_ttl_suggestions: RestoreTtlSuggestionApi[];
+}
+
+export type EntryDurability = 'persistent' | 'temporary' | 'instance';
+
+export interface EntryGrowthProjection {
+  bytes_per_call: number;
+  estimated_calls_remaining: number;
+}
+
+export interface EntrySizeMeasurement {
+  key: string;
+  xdr_size_bytes: number;
+  durability: EntryDurability;
+  percent_of_max: number;
+  growth_projection: EntryGrowthProjection | null;
+}
+
+export interface EntrySizeAnalysis {
+  max_entry_size_bytes: number;
+  entries: EntrySizeMeasurement[];
+  unmeasured: number;
 }
 
 export interface InsightEntry {
@@ -130,15 +170,28 @@ export interface SimulationStateSnapshot {
 }
 
 export interface ResourceReport extends SorobanResources {
+  bytes_by_durability: {
+    read: DurabilityByteCounts;
+    write: DurabilityByteCounts;
+  };
   cost_stroops: number;
   testnet_averages?: TestnetAverages;
   state_dependency: StateDependencyReport[] | null;
   ttl_analysis: TtlAnalysisApiReport | null;
+  entry_size_analysis: EntrySizeAnalysis;
   nutrition: NutritionReport;
   call_graph: CallGraph | null;
   call_graph_mermaid: string | null;
   state_snapshot: SimulationStateSnapshot | null;
   protocol_version: number;
+}
+
+export interface DurabilityByteCounts {
+  code: number;
+  instance: number;
+  persistent: number;
+  temporary: number;
+  other: number;
 }
 
 export type AnalyzeResponse = ResourceReport;
