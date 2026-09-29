@@ -454,6 +454,32 @@ impl ProviderRegistry {
         }
     }
 
+    pub async fn report_rate_limit_failure(&self, url: &str) {
+        if let Some(state) = self.find_by_url(url).await {
+            let prev = state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+            state.local_score.store(
+                adjust_score(
+                    state.local_score.load(Ordering::Relaxed),
+                    -(LOCAL_FAILURE_PENALTY * 2),
+                ),
+                Ordering::Relaxed,
+            );
+            if prev + 1 >= CIRCUIT_BREAKER_THRESHOLD {
+                let mut tripped = state.tripped_at.write().await;
+                if tripped.is_none() {
+                    *tripped = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    pub async fn select_failover_provider(&self, exclude_url: Option<&str>) -> Option<RpcProvider> {
+        let healthy = self.healthy_providers().await;
+        healthy
+            .into_iter()
+            .find(|p| exclude_url.map_or(true, |ex| p.url != ex))
+    }
+
     pub fn is_retryable_status(status: u16) -> bool {
         status == 429 || status >= 500
     }
@@ -461,24 +487,59 @@ impl ProviderRegistry {
     pub fn spawn_health_checker(
         self: &Arc<Self>,
         interval: Duration,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         let registry = Arc::clone(self);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
-                ticker.tick().await;
-                registry.run_health_checks().await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => {
+                        tracing::info!("RPC health checker shutting down");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.recv() => {
+                                tracing::info!("RPC health checker shutting down");
+                                break;
+                            }
+                            _ = registry.run_health_checks() => {}
+                        }
+                    }
+                }
             }
         })
     }
 
-    pub fn spawn_gossip_task(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_gossip_task(
+        self: &Arc<Self>,
+        interval: Duration,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
         let registry = Arc::clone(self);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
-                ticker.tick().await;
-                registry.run_gossip_round().await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => {
+                        tracing::info!("Provider gossip task shutting down");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.recv() => {
+                                tracing::info!("Provider gossip task shutting down");
+                                break;
+                            }
+                            _ = registry.run_gossip_round() => {}
+                        }
+                    }
+                }
             }
         })
     }
@@ -706,7 +767,7 @@ impl ProviderRegistry {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "getLatestLedger",
+            "method": "getHealth",
             "params": null
         });
 
@@ -715,13 +776,21 @@ impl ProviderRegistry {
             req = req.header(header.as_str(), value.as_str());
         }
 
+        let start = Instant::now();
         let response = tokio::time::timeout(HEALTH_CHECK_TIMEOUT, req.send())
             .await
             .map_err(|_| "timeout".to_string())?
             .map_err(|error| format!("request error: {error}"))?;
 
+        let rtt_us = start.elapsed().as_micros() as u64;
+        state.stats.record(rtt_us);
+
         if !response.status().is_success() {
             return Err(format!("HTTP {}", response.status().as_u16()));
+        }
+
+        if rtt_us > 2_000_000 {
+            return Err(format!("RTT latency high: {}ms (> 2000ms)", rtt_us / 1000));
         }
 
         let json: serde_json::Value = response
@@ -729,9 +798,18 @@ impl ProviderRegistry {
             .await
             .map_err(|error| format!("parse error: {error}"))?;
 
-        json["result"]["sequence"]
+        if let Some(status) = json["result"]["status"].as_str() {
+            if status != "healthy" {
+                return Err(format!("RPC status unhealthy: {status}"));
+            }
+        }
+
+        let sequence = json["result"]["sequence"]
             .as_u64()
-            .ok_or_else(|| "missing sequence in response".to_string())
+            .or_else(|| json["result"]["latestLedger"].as_u64())
+            .unwrap_or(0);
+
+        Ok(sequence)
     }
 
     async fn find_by_url(&self, url: &str) -> Option<Arc<ProviderState>> {
@@ -1255,5 +1333,56 @@ mod tests {
         // EMA for `a` converged to 1_000; `b` seeded at 10_000.
         assert_eq!(a.ema_rtt_us, 1_000);
         assert_eq!(b.ema_rtt_us, 10_000);
+    }
+
+    #[tokio::test]
+    async fn health_checker_exits_when_shutdown_is_broadcast() {
+        let registry = ProviderRegistry::new(vec![make_provider("a", "http://a.test")]);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = registry.spawn_health_checker(Duration::from_millis(10), shutdown_rx);
+
+        shutdown_tx
+            .send(())
+            .expect("shutdown broadcast should succeed");
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("health checker should exit promptly after shutdown")
+            .expect("health checker task should not panic");
+    }
+
+    #[tokio::test]
+    async fn gossip_task_exits_when_shutdown_is_broadcast() {
+        let registry = ProviderRegistry::new(vec![make_provider("a", "http://a.test")]);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = registry.spawn_gossip_task(Duration::from_millis(10), shutdown_rx);
+
+        shutdown_tx
+            .send(())
+            .expect("shutdown broadcast should succeed");
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("gossip task should exit promptly after shutdown")
+            .expect("gossip task should not panic");
+    }
+
+    #[tokio::test]
+    async fn test_select_failover_provider_and_rate_limit_penalty() {
+        let registry = ProviderRegistry::new(vec![
+            make_provider("node-1", "http://node1.test"),
+            make_provider("node-2", "http://node2.test"),
+        ]);
+
+        let initial = registry.select_failover_provider(None).await;
+        assert!(initial.is_some());
+
+        let fallback = registry.select_failover_provider(Some("http://node1.test")).await;
+        assert_eq!(fallback.unwrap().url, "http://node2.test");
+
+        registry.report_rate_limit_failure("http://node1.test").await;
+        let reports = registry.provider_reports().await;
+        let n1 = reports.iter().find(|r| r.url == "http://node1.test").unwrap();
+        assert!(n1.local_score < LOCAL_PROVIDER_STARTING_SCORE);
     }
 }

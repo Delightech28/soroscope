@@ -1,6 +1,15 @@
 "use client";
 
-import React, { createContext, useContext, useEffect, useState } from "react";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { useNetwork } from "./NetworkContext";
+import { fetchAccountBalances, AssetBalance } from "../lib/stellarBalances";
 
 interface WalletContextType {
   connect: (moduleId: string) => Promise<void>;
@@ -14,6 +23,10 @@ interface WalletContextType {
   isModalOpen: boolean;
   supportedWallets: { id: string; name: string; icon: string }[];
   error: string | null;
+  balances: AssetBalance[];
+  balancesLoading: boolean;
+  balancesError: string | null;
+  refreshBalances: () => void;
 }
 
 const WalletContext = createContext<WalletContextType | undefined>(undefined);
@@ -27,6 +40,7 @@ export const useWallet = () => {
 };
 
 export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
+  const { networkId, network } = useNetwork();
   const [address, setAddress] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [selectedWalletId, setSelectedWalletId] = useState<string | null>(null);
@@ -34,13 +48,37 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
   const [error, setError] = useState<string | null>(null);
   const [kit, setKit] = useState<any>(null);
 
+  // Account balance state lives alongside the wallet so it can be cleared
+  // atomically on disconnect / account change and never leak between sessions.
+  const [balances, setBalances] = useState<AssetBalance[]>([]);
+  const [balancesLoading, setBalancesLoading] = useState(false);
+  const [balancesError, setBalancesError] = useState<string | null>(null);
+  const balanceReqRef = useRef<AbortController | null>(null);
+  const [balanceRefreshTick, setBalanceRefreshTick] = useState(0);
+
+  // Drops every piece of derived, address-scoped state. Called on disconnect
+  // and whenever the active account changes so no stale balance is shown for
+  // the wrong account.
+  const clearWalletState = useCallback(() => {
+    balanceReqRef.current?.abort();
+    balanceReqRef.current = null;
+    setBalances([]);
+    setBalancesLoading(false);
+    setBalancesError(null);
+  }, []);
+
   useEffect(() => {
     const initKit = async () => {
       try {
         const walletKitModule = await import("@creit.tech/stellar-wallets-kit");
 
+        let walletNet = walletKitModule.WalletNetwork.TESTNET;
+        if (networkId === "mainnet") walletNet = walletKitModule.WalletNetwork.PUBLIC;
+        else if (networkId === "futurenet") walletNet = walletKitModule.WalletNetwork.FUTURENET;
+        else if (networkId === "localhost") walletNet = walletKitModule.WalletNetwork.SANDBOX || walletKitModule.WalletNetwork.TESTNET;
+
         const kitInstance = new walletKitModule.StellarWalletsKit({
-          network: walletKitModule.WalletNetwork.TESTNET,
+          network: walletNet,
           selectedWalletId: walletKitModule.FREIGHTER_ID,
           modules: walletKitModule.allowAllModules(),
         });
@@ -60,7 +98,57 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
     };
 
     initKit();
+  }, [networkId]);
+
+  // Fetch balances whenever the connected account, network, or an explicit
+  // refresh changes. Stale balances are cleared up-front so the UI never shows
+  // one account's holdings against another's address while a fetch is in flight.
+  useEffect(() => {
+    if (!address) {
+      clearWalletState();
+      return;
+    }
+
+    balanceReqRef.current?.abort();
+    const controller = new AbortController();
+    balanceReqRef.current = controller;
+
+    setBalances([]);
+    setBalancesLoading(true);
+    setBalancesError(null);
+
+    fetchAccountBalances(network.horizonUrl, address, controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        setBalances(result);
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
+        setBalancesError(
+          err instanceof Error ? err.message : "Failed to load balances",
+        );
+      })
+      .finally(() => {
+        if (controller.signal.aborted) return;
+        setBalancesLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [address, network.horizonUrl, balanceRefreshTick, clearWalletState]);
+
+  const refreshBalances = useCallback(() => {
+    setBalanceRefreshTick((t) => t + 1);
   }, []);
+
+  const resetWalletSession = useCallback(() => {
+    setAddress(null);
+    setSelectedWalletId(null);
+    setIsConnecting(false);
+    setError(null);
+    clearWalletState();
+    localStorage.removeItem("inheritx_wallet_address");
+    localStorage.removeItem("inheritx_wallet_id");
+  }, [clearWalletState]);
 
   const supportedWallets = [
     { id: "freighter", name: "Freighter", icon: "https://stellar.creit.tech/wallet-icons/freighter.png" },
@@ -98,6 +186,8 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
   };
 
   const disconnect = async () => {
+    resetWalletSession();
+
     if (kit) {
       try {
         await kit.disconnect();
@@ -105,11 +195,6 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
         console.error("Disconnect error:", err);
       }
     }
-    setAddress(null);
-    setSelectedWalletId(null);
-    setError(null);
-    localStorage.removeItem("inheritx_wallet_address");
-    localStorage.removeItem("inheritx_wallet_id");
   };
 
   const openModal = () => {
@@ -122,22 +207,26 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
     setIsModalOpen(false);
   };
 
+  const contextValue = React.useMemo(() => ({
+    connect: connectWallet,
+    disconnect,
+    address,
+    isConnected: !!address,
+    isConnecting,
+    selectedWalletId,
+    openModal,
+    closeModal,
+    isModalOpen,
+    supportedWallets,
+    error,
+    balances,
+    balancesLoading,
+    balancesError,
+    refreshBalances,
+  }), [address, isConnecting, selectedWalletId, isModalOpen, error, balances, balancesLoading, balancesError, refreshBalances]);
+
   return (
-    <WalletContext.Provider
-      value={{
-        connect: connectWallet,
-        disconnect,
-        address,
-        isConnected: !!address,
-        isConnecting,
-        selectedWalletId,
-        openModal,
-        closeModal,
-        isModalOpen,
-        supportedWallets,
-        error,
-      }}
-    >
+    <WalletContext.Provider value={contextValue}>
       {children}
     </WalletContext.Provider>
   );

@@ -19,6 +19,18 @@ This contract provides a full-featured governance system where proposals progres
 - **Quorum Requirements**: Minimum participation thresholds
 - **Timelock Execution**: Delayed execution for security
 - **Admin Controls**: Proposal cancellation and parameter management
+- **M-of-N Execution Authorization**: A configurable, distinct set of administrators must approve execution.
+
+## Multi-signature execution
+
+Use `initialize_with_admins` to configure the execution administrator set and the required threshold. The primary `admin` remains responsible for voter management, while `execute_proposal` accepts the proposal ID and a list of approving administrators. Every approver must be a configured administrator, authorize the call, and be distinct; duplicate addresses never count twice.
+
+```rust
+client.initialize_with_admins(&primary_admin, &admins, &2, &9, &false);
+client.execute_proposal(&proposal_id, &approvers); // requires two distinct admin approvals
+```
+
+The legacy `initialize` method configures a one-of-one execution policy for backwards compatibility.
 
 ## Proposal States
 

@@ -1,10 +1,12 @@
 #![cfg(test)]
+extern crate std;
 
 use crate::{Gasless, GaslessClient, MetaTx};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
+    contract, contractimpl,
+    testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, IntoVal, Symbol,
+    Address, Env, Symbol,
 };
 
 const AMOUNT: i128 = 1_000_000;
@@ -240,7 +242,78 @@ fn test_execute_emits_event() {
 
     let events = ctx.env.events().all();
     let has_executed = events.iter().any(|(_, topics, _)| {
-        topics.len() == 1 && topics.get(0) == Some(Symbol::new(&ctx.env, "executed").into_val(&ctx.env))
+        use soroban_sdk::TryFromVal;
+        topics.len() == 1
+            && topics
+                .get(0)
+                .and_then(|v| Symbol::try_from_val(&ctx.env, &v).ok())
+                == Some(Symbol::new(&ctx.env, "executed"))
     });
     assert!(has_executed, "expected 'executed' event");
+}
+
+/// A "broken token" contract that always panics on transfer.
+/// Used to test nonce consumption on transfer failure.
+#[contract]
+struct BrokenToken;
+
+#[contractimpl]
+impl BrokenToken {
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {
+        panic!("broken token always fails");
+    }
+}
+
+#[test]
+fn test_nonce_consumed_on_failed_transfer() {
+    let env = Env::default();
+    env.ledger().with_mut(|l| {
+        l.timestamp = BASE_TIME;
+    });
+
+    let relayer = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    let broken_token_id = env.register(BrokenToken, ());
+
+    env.mock_all_auths();
+
+    let gasless_id = env.register(Gasless, ());
+    GaslessClient::new(&env, &gasless_id).initialize(&relayer);
+
+    let client = GaslessClient::new(&env, &gasless_id);
+
+    assert_eq!(client.nonce(&alice), 0);
+
+    // Execute with the broken token — transfer will panic,
+    // but the nonce MUST be consumed (call does NOT panic).
+    let failing_tx = MetaTx {
+        from: alice.clone(),
+        to: bob.clone(),
+        token: broken_token_id.clone(),
+        amount: AMOUNT,
+        nonce: 0,
+        deadline: DEADLINE,
+    };
+
+    // Should NOT panic — try_invoke_contract catches the revert.
+    client.execute(&relayer, &failing_tx);
+
+    // Nonce must be consumed (incremented to 1) despite transfer failure.
+    assert_eq!(client.nonce(&alice), 1);
+
+    // Replay of nonce 0 must still revert — nonce is consumed.
+    let replay_tx = MetaTx {
+        from: alice.clone(),
+        to: bob.clone(),
+        token: broken_token_id,
+        amount: AMOUNT,
+        nonce: 0,
+        deadline: DEADLINE,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute(&relayer, &replay_tx);
+    }));
+    assert!(result.is_err(), "replay with consumed nonce must revert");
 }

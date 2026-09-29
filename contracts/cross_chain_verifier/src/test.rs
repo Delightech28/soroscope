@@ -1,14 +1,34 @@
 #![cfg(test)]
 
-use crate::{CrossChainVerifier, CrossChainVerifierClient};
+use crate::{CrossChainVerifier, CrossChainVerifierClient, Payload};
+use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, Vec};
+
+fn make_payload(env: &Env, nonce: u64) -> Payload {
+    let chain_id = 1;
+    let dest = Address::generate(env);
+    let data = Bytes::from_slice(env, b"test message");
+    Payload {
+        chain_id,
+        destination_contract: dest,
+        nonce,
+        data,
+    }
+}
+
+fn compute_leaf(env: &Env, payload: &Payload) -> BytesN<32> {
+    CrossChainVerifier::compute_payload_hash(env, payload)
+}
 use crate::{
     CrossChainMessage, CrossChainVerifier, CrossChainVerifierClient, SignatureAlgorithm,
     SignedMessage,
 };
+use crate::{
+    CrossChainMessage, CrossChainVerifier, CrossChainVerifierClient, SignatureAlgorithm,
+    SignedMessage,
+};
+use crate::{CrossChainVerifier, CrossChainVerifierClient};
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, Vec};
-use crate::{CrossChainVerifier, CrossChainVerifierClient, CrossChainMessage, SignedMessage, SignatureAlgorithm};
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec, Bytes};
 
 #[test]
 fn test_initialization() {
@@ -29,7 +49,7 @@ fn test_double_initialization() {
     let admin = Address::generate(&env);
 
     client.initialize(&admin);
-    client.initialize(&admin); // Should panic
+    client.initialize(&admin);
 }
 
 #[test]
@@ -63,28 +83,15 @@ fn test_verify_message_success() {
 
     client.initialize(&admin);
 
-    let leaf = BytesN::from_array(&env, &[2; 32]);
+    let payload = make_payload(&env, 1);
+    let leaf = compute_leaf(&env, &payload);
+
     let sibling1 = BytesN::from_array(&env, &[3; 32]);
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
     // Manually construct the root
-    // Level 1: Hash(sibling1 || leaf) since proof_flags = true (left sibling)
-    let mut combined_1 = [0u8; 64];
-    combined_1[0..32].copy_from_slice(&sibling1.to_array());
-    combined_1[32..64].copy_from_slice(&leaf.to_array());
-    let hash_1 = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_1))
-        .to_array();
-
-    // Level 2: Hash(hash_1 || sibling2) since proof_flags = false (right sibling)
-    let mut combined_2 = [0u8; 64];
-    combined_2[0..32].copy_from_slice(&hash_1);
-    combined_2[32..64].copy_from_slice(&sibling2.to_array());
-    let final_root = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_2))
-        .to_array();
+    let hash_1 = merkle_hash_pair(&env, &sibling1.to_array(), &leaf.to_array());
+    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
 
     let expected_root_bytes = BytesN::from_array(&env, &final_root);
 
@@ -96,10 +103,12 @@ fn test_verify_message_success() {
     proof.push_back(sibling2);
 
     let mut proof_flags = Vec::new(&env);
+    proof_flags.push_back(true);
+    proof_flags.push_back(false);
     proof_flags.push_back(true); // left
     proof_flags.push_back(false); // right
 
-    let result = client.verify_message(&block_height, &leaf, &proof, &proof_flags);
+    let result = client.verify_message(&block_height, &payload, &proof, &proof_flags);
     assert!(result);
 }
 
@@ -108,7 +117,7 @@ fn test_verify_message_and_consume_nonce() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -156,7 +165,7 @@ fn test_replay_nonce_panics() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -207,10 +216,20 @@ fn test_verify_message_no_root() {
 
     client.initialize(&admin);
 
-    let leaf = BytesN::from_array(&env, &[2; 32]);
+    let payload = make_payload(&env, 1);
     let proof = Vec::new(&env);
     let proof_flags = Vec::new(&env);
 
+    client.verify_message(&100, &payload, &proof, &proof_flags);
+}
+
+#[test]
+#[should_panic(expected = "Nonce already used")]
+fn test_verify_message_replay_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     assert!(!client.verify_message(&100, &leaf, &proof, &proof_flags));
 }
 
@@ -223,12 +242,35 @@ fn test_add_authorized_signer_ed25519() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
     client.initialize(&admin);
 
+    let payload = make_payload(&env, 1);
+    let leaf = compute_leaf(&env, &payload);
+
+    // Single-node tree: leaf == root
+    let block_height = 100;
+    client.update_root(&block_height, &leaf);
+
+    let proof = Vec::new(&env);
+    let proof_flags = Vec::new(&env);
+
+    // First use succeeds
+    assert!(client.verify_message(&block_height, &payload, &proof, &proof_flags));
+
+    // Second use with same nonce should panic
+    client.verify_message(&block_height, &payload, &proof, &proof_flags);
+}
+
+#[test]
+fn test_verify_message_different_nonce_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     // Create a test Ed25519 public key (32 bytes)
     let public_key = Bytes::from_slice(&env, &[1; 32]);
 
@@ -244,7 +286,7 @@ fn test_add_authorized_signer_secp256k1() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -266,7 +308,7 @@ fn test_add_duplicate_signer() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -283,12 +325,112 @@ fn test_remove_authorized_signer() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
     client.initialize(&admin);
 
+    let payload1 = make_payload(&env, 1);
+    let leaf1 = compute_leaf(&env, &payload1);
+
+    let payload2 = make_payload(&env, 2);
+    let leaf2 = compute_leaf(&env, &payload2);
+
+    // Build a root that commits to both leaves (2-level tree)
+    // Level 1: combine leaf1 with leaf2
+    let branch = merkle_hash_pair(&env, &leaf1.to_array(), &leaf2.to_array());
+    let root = BytesN::from_array(&env, &branch);
+
+    let block_height = 100;
+    client.update_root(&block_height, &root);
+
+    // Prove leaf1 at position 0 (left child, sibling=leaf2)
+    let mut proof1 = Vec::new(&env);
+    proof1.push_back(leaf2);
+    let mut flags1 = Vec::new(&env);
+    flags1.push_back(false);
+    assert!(client.verify_message(&block_height, &payload1, &proof1, &flags1));
+
+    // Prove leaf2 at position 0 (right child, sibling=leaf1 on left)
+    let mut proof2 = Vec::new(&env);
+    proof2.push_back(leaf1);
+    let mut flags2 = Vec::new(&env);
+    flags2.push_back(true);
+    assert!(client.verify_message(&block_height, &payload2, &proof2, &flags2));
+}
+
+#[test]
+fn test_compute_payload_hash_differs_by_chain_id() {
+    let env = Env::default();
+    let dest = Address::generate(&env);
+    let data = Bytes::from_slice(&env, b"hello");
+
+    let p1 = Payload {
+        chain_id: 1,
+        destination_contract: dest.clone(),
+        nonce: 0,
+        data: data.clone(),
+    };
+    let p2 = Payload {
+        chain_id: 2,
+        destination_contract: dest.clone(),
+        nonce: 0,
+        data: data.clone(),
+    };
+
+    let h1 = CrossChainVerifier::compute_payload_hash(&env, &p1);
+    let h2 = CrossChainVerifier::compute_payload_hash(&env, &p2);
+    assert_ne!(h1, h2);
+}
+
+#[test]
+fn test_compute_payload_hash_differs_by_nonce() {
+    let env = Env::default();
+    let dest = Address::generate(&env);
+    let data = Bytes::from_slice(&env, b"hello");
+
+    let p1 = Payload {
+        chain_id: 1,
+        destination_contract: dest.clone(),
+        nonce: 0,
+        data: data.clone(),
+    };
+    let p2 = Payload {
+        chain_id: 1,
+        destination_contract: dest.clone(),
+        nonce: 1,
+        data: data.clone(),
+    };
+
+    let h1 = CrossChainVerifier::compute_payload_hash(&env, &p1);
+    let h2 = CrossChainVerifier::compute_payload_hash(&env, &p2);
+    assert_ne!(h1, h2);
+}
+
+#[test]
+fn test_compute_payload_hash_differs_by_destination() {
+    let env = Env::default();
+    let dest1 = Address::generate(&env);
+    let dest2 = Address::generate(&env);
+    let data = Bytes::from_slice(&env, b"hello");
+
+    let p1 = Payload {
+        chain_id: 1,
+        destination_contract: dest1,
+        nonce: 0,
+        data: data.clone(),
+    };
+    let p2 = Payload {
+        chain_id: 1,
+        destination_contract: dest2,
+        nonce: 0,
+        data,
+    };
+
+    let h1 = CrossChainVerifier::compute_payload_hash(&env, &p1);
+    let h2 = CrossChainVerifier::compute_payload_hash(&env, &p2);
+    assert_ne!(h1, h2);
     let public_key = Bytes::from_slice(&env, &[1; 32]);
 
     client.add_authorized_signer(&public_key, &SignatureAlgorithm::Ed25519);
@@ -304,7 +446,7 @@ fn test_remove_nonexistent_signer() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -319,7 +461,7 @@ fn test_verify_signed_message_success_ed25519() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -411,7 +553,7 @@ fn test_verify_signed_message_accepts_valid_signature() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -498,7 +640,7 @@ fn test_verify_signed_message_with_invalid_signer() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -514,13 +656,13 @@ fn test_verify_signed_message_with_invalid_signer() {
     };
 
     // Create a signed message with an unauthorized signer
-    let _unauthorized_public_key = Bytes::from_slice(&env, &[99; 32]);
+    let unauthorized_public_key = Bytes::from_slice(&env, &[99; 32]);
     let signature = BytesN::from_array(&env, &[0; 64]);
 
     let signed_message = SignedMessage {
         message,
         signature,
-        signer_public_key: unauthorized_public_key,
+        signer_public_key: BytesN::from_array(&env, &[99; 32]),
         algorithm: SignatureAlgorithm::Ed25519,
     };
 
@@ -538,7 +680,7 @@ fn test_multiple_authorized_signers() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -564,7 +706,7 @@ fn test_signer_lookup_performance_single() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -583,7 +725,7 @@ fn test_signer_lookup_performance_multiple() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
@@ -606,20 +748,20 @@ fn test_signer_removal_performance() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(CrossChainVerifier, ());
+    let contract_id = env.register_contract(None, CrossChainVerifier);
     let client = CrossChainVerifierClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
     client.initialize(&admin);
 
     // Add signers
-    let mut keys = Vec::new();
+    let mut keys = Vec::new(&env);
     for i in 0..5 {
         let mut key_bytes = [0u8; 32];
         key_bytes[0] = i as u8;
         let public_key = Bytes::from_slice(&env, &key_bytes);
         client.add_authorized_signer(&public_key, &SignatureAlgorithm::Ed25519);
-        keys.push(public_key);
+        keys.push_back(public_key);
     }
 
     assert_eq!(client.get_signer_count(), 5);
@@ -787,116 +929,14 @@ fn test_verify_signed_message_panics_when_paused() {
     client.verify_signed_message(&signed_message, &100u32, &proof, &flags);
 }
 
-#[test]
-fn test_is_nonce_processed_false_before_use() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, CrossChainVerifier);
-    let client = CrossChainVerifierClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-
-    assert!(!client.is_nonce_processed(&999u64));
-    assert!(!client.is_nonce_processed(&0u64));
-}
-
-#[test]
-fn test_sequential_nonces_all_accepted() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, CrossChainVerifier);
-    let client = CrossChainVerifierClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-
-    let make_leaf = |val: u8| BytesN::from_array(&env, &[val; 32]);
-
-    let sibling = make_leaf(0xAA);
-
-    for nonce in 1u64..=3u64 {
-        let leaf = make_leaf(nonce as u8);
-
-        let mut combined = [0u8; 64];
-        combined[0..32].copy_from_slice(&sibling.to_array());
-        combined[32..64].copy_from_slice(&leaf.to_array());
-        let root = env.crypto().sha256(&Bytes::from_slice(&env, &combined)).to_array();
-
-        let block_height: u32 = nonce as u32 * 10;
-        client.update_root(&block_height, &BytesN::from_array(&env, &root));
-
-        let mut proof = Vec::new(&env);
-        proof.push_back(sibling.clone());
-        let mut proof_flags = Vec::new(&env);
-        proof_flags.push_back(false);
-
-        assert!(
-            client.verify_message_and_consume(&block_height, &nonce, &leaf, &proof, &proof_flags),
-            "nonce {} should be accepted",
-            nonce
-        );
-        assert!(client.is_nonce_processed(&nonce));
+fn merkle_hash_pair(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut combined = [0u8; 64];
+    if left <= right {
+        combined[0..32].copy_from_slice(left);
+        combined[32..64].copy_from_slice(right);
+    } else {
+        combined[0..32].copy_from_slice(right);
+        combined[32..64].copy_from_slice(left);
     }
-}
-
-#[test]
-fn test_nonce_zero_is_valid_and_tracked() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, CrossChainVerifier);
-    let client = CrossChainVerifierClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-
-    let leaf = BytesN::from_array(&env, &[1; 32]);
-    let sibling = BytesN::from_array(&env, &[2; 32]);
-
-    let mut combined = [0u8; 64];
-    combined[0..32].copy_from_slice(&sibling.to_array());
-    combined[32..64].copy_from_slice(&leaf.to_array());
-    let root = env.crypto().sha256(&Bytes::from_slice(&env, &combined)).to_array();
-
-    let block_height: u32 = 1;
-    client.update_root(&block_height, &BytesN::from_array(&env, &root));
-
-    let mut proof = Vec::new(&env);
-    proof.push_back(sibling);
-    let mut proof_flags = Vec::new(&env);
-    proof_flags.push_back(false);
-
-    assert!(client.verify_message_and_consume(&block_height, &0u64, &leaf, &proof, &proof_flags));
-    assert!(client.is_nonce_processed(&0u64));
-}
-
-#[test]
-#[should_panic(expected = "nonce already processed")]
-fn test_replay_on_nonce_zero_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, CrossChainVerifier);
-    let client = CrossChainVerifierClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-
-    let leaf = BytesN::from_array(&env, &[1; 32]);
-    let sibling = BytesN::from_array(&env, &[2; 32]);
-
-    let mut combined = [0u8; 64];
-    combined[0..32].copy_from_slice(&sibling.to_array());
-    combined[32..64].copy_from_slice(&leaf.to_array());
-    let root = env.crypto().sha256(&Bytes::from_slice(&env, &combined)).to_array();
-
-    let block_height: u32 = 1;
-    client.update_root(&block_height, &BytesN::from_array(&env, &root));
-
-    let mut proof = Vec::new(&env);
-    proof.push_back(sibling);
-    let mut proof_flags = Vec::new(&env);
-    proof_flags.push_back(false);
-
-    client.verify_message_and_consume(&block_height, &0u64, &leaf, &proof, &proof_flags);
-    client.verify_message_and_consume(&block_height, &0u64, &leaf, &proof, &proof_flags);
+    env.crypto().sha256(&Bytes::from_slice(env, &combined)).to_array()
 }

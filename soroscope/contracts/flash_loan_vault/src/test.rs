@@ -2,7 +2,6 @@ use super::*;
 use soroban_sdk::{
     contract, contractimpl, contracttype, testutils::Address as _, Address, Env,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, testutils::Address as _, Address, Env};
 
 // ── Mock receivers ───────────────────────────────────────────────────────────
 
@@ -204,6 +203,21 @@ pub mod reentrant {
     #[derive(Clone)]
     enum ReentrantReceiverDataKey {
         Vault,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub mod non_compliant {
+    use super::*;
+    /// A contract that does NOT implement the FlashLoanReceiver interface.
+    #[contract]
+    pub struct NonCompliantReceiver;
+
+    #[contractimpl]
+    impl NonCompliantReceiver {
+        /// Intentionally does not implement execute_operation.
+        pub fn dummy(_e: Env) {}
     }
 }
 
@@ -841,4 +855,37 @@ fn test_get_available_after_deposit() {
     let s = setup();
     fund_vault(&s, 5_000);
     assert_eq!(s.vault_client.get_available(), 5_000);
+}
+
+// ── Flash loan: interface verification ──────────────────────────────────────
+
+#[test]
+fn test_flash_loan_non_compliant_receiver_returns_error() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    let receiver_id = s.e.register(non_compliant::NonCompliantReceiver, ());
+    let initiator = Address::generate(&s.e);
+
+    let result = s
+        .vault_client
+        .try_flash_loan(&initiator, &receiver_id, &5_000);
+
+    assert!(result.is_err());
+    // Vault funds should remain intact.
+    assert_eq!(s.vault_client.get_available(), 10_000);
+    assert_eq!(s.token_client.balance(&receiver_id), 0);
+}
+
+#[test]
+fn test_borrow_non_compliant_receiver_returns_error() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    let receiver_id = s.e.register(non_compliant::NonCompliantReceiver, ());
+
+    let result = s.vault_client.try_borrow(&receiver_id, &5_000);
+
+    assert!(result.is_err());
+    assert_eq!(s.vault_client.get_available(), 10_000);
 }

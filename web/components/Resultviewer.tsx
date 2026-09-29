@@ -3,6 +3,7 @@
 import type { InvocationResult } from '../lib/sorobantypes';
 
 import { CallGraphVisualizer } from './CallGraphVisualizer';
+import { CopyButton } from './CopyButton';
 
 interface ResultViewerProps {
   result: InvocationResult | null;
@@ -27,10 +28,10 @@ export function ResultViewer({ result }: ResultViewerProps) {
       <div
         style={{
           padding: '24px',
-          backgroundColor: '#0d1117',
+          backgroundColor: 'var(--bg-elevated)',
           borderRadius: '8px',
           textAlign: 'center',
-          color: '#8b949e',
+          color: 'var(--text-secondary)',
           border: '1px solid #30363d',
         }}
       >
@@ -43,7 +44,7 @@ export function ResultViewer({ result }: ResultViewerProps) {
     <div
       style={{
         padding: '24px',
-        backgroundColor: '#0d1117',
+        backgroundColor: 'var(--bg-elevated)',
         borderRadius: '8px',
         borderLeft: `4px solid ${result.success ? '#00d9ff' : '#fb8500'}`,
         border: `1px solid #30363d`,
@@ -61,7 +62,7 @@ export function ResultViewer({ result }: ResultViewerProps) {
           >
             {result.success ? '✓ Success' : '✗ Error'}
           </h3>
-          <p style={{ margin: '0', color: '#8b949e', fontSize: '12px' }}>
+          <p style={{ margin: '0', color: 'var(--text-secondary)', fontSize: '12px' }}>
             {new Date(result.timestamp).toLocaleString()}
           </p>
         </div>
@@ -90,7 +91,7 @@ export function ResultViewer({ result }: ResultViewerProps) {
       {result.error ? (
         <div
           style={{
-            backgroundColor: '#0d1117',
+            backgroundColor: 'var(--bg-elevated)',
             padding: '16px',
             borderRadius: '6px',
             marginBottom: '12px',
@@ -133,7 +134,7 @@ export function ResultViewer({ result }: ResultViewerProps) {
               {result.error}
             </div>
           </div>
-          <div style={{ fontSize: '12px', color: '#8b949e', lineHeight: 1.6 }}>
+          <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
             {result.errorType === 'NETWORK_ERROR' ? (
               <>
                 ⚠️ The analyzer backend isn’t responding — it may have crashed or isn’t running.
@@ -157,7 +158,7 @@ export function ResultViewer({ result }: ResultViewerProps) {
         result.result && (
           <div
             style={{
-              backgroundColor: '#0d1117',
+              backgroundColor: 'var(--bg-elevated)',
               padding: '12px',
               borderRadius: '6px',
               marginBottom: '12px',
@@ -171,15 +172,20 @@ export function ResultViewer({ result }: ResultViewerProps) {
               overflow: 'auto',
             }}
           >
-            <strong style={{ color: '#8b949e' }}>Result:</strong>
-            <br />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+              <strong style={{ color: 'var(--text-secondary)' }}>Result:</strong>
+              <CopyButton text={JSON.stringify(result.result, null, 2)} label="Copy Result" tooltipPosition="left" />
+            </div>
             {JSON.stringify(result.result, null, 2)}
           </div>
         )
       )}
 
-      {result.callGraphMermaid && (
-        <CallGraphVisualizer mermaidDefinition={result.callGraphMermaid} />
+      {(result.callGraph || result.callGraphMermaid) && (
+        <CallGraphVisualizer
+          callGraph={result.callGraph}
+          mermaidDefinition={result.callGraphMermaid}
+        />
       )}
     </div>
   );

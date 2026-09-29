@@ -5,7 +5,7 @@ use crate::allowance::{read_allowance, spend_allowance, write_allowance};
 use crate::balance::{read_balance, receive_balance, spend_balance};
 use crate::metadata::{read_decimal, read_name, read_symbol, write_metadata};
 use emergency_guard::{EmergencyGuard, GuardError, PauseType};
-use soroban_sdk::{contract, contractimpl, vec, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, String, Vec};
 
 fn ensure_not_paused(e: &Env, operation: u32) {
     if EmergencyGuard::is_paused(e.clone(), operation) {
@@ -29,6 +29,14 @@ pub trait TokenTrait {
     fn symbol(e: Env) -> String;
     fn guard_pause(e: Env, admin: Address, operation: u32, paused: bool) -> Result<(), GuardError>;
     fn guard_unpause(e: Env, approvers: Vec<Address>) -> Result<(), GuardError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct BurnEvent {
+    pub burner: Address,
+    pub target_account: Address,
+    pub amount: i128,
 }
 
 #[contract]
@@ -112,15 +120,35 @@ impl TokenTrait for Token {
         ensure_not_paused(&e, PauseType::BURN);
         from.require_auth();
         e.storage().instance().extend_ttl(100, 100);
-        spend_balance(&e, from, amount);
+
+        spend_balance(&e, from.clone(), amount);
+
+        e.events().publish(
+            (String::from_str(&e, "burn"), from.clone()),
+            BurnEvent {
+                burner: from.clone(),
+                target_account: from,
+                amount,
+            },
+        );
     }
 
     fn burn_from(e: Env, spender: Address, from: Address, amount: i128) {
         ensure_not_paused(&e, PauseType::BURN);
         spender.require_auth();
         e.storage().instance().extend_ttl(100, 100);
-        spend_allowance(&e, from.clone(), spender, amount);
-        spend_balance(&e, from, amount);
+
+        spend_allowance(&e, from.clone(), spender.clone(), amount);
+        spend_balance(&e, from.clone(), amount);
+
+        e.events().publish(
+            (String::from_str(&e, "burn"), from.clone()),
+            BurnEvent {
+                burner: spender,
+                target_account: from,
+                amount,
+            },
+        );
     }
 
     fn decimals(e: Env) -> u32 {

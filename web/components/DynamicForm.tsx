@@ -5,18 +5,54 @@ import React from "react"
 import { useState } from 'react';
 import type { ContractFunction, SimulationInputs } from '../lib/sorobantypes';
 import { Loader2 } from 'lucide-react';
+import { validateField } from '../lib/validationSchemas';
+
+import { simulationQueueManager } from '../lib/requestQueue';
 
 interface DynamicFormProps {
   func: ContractFunction;
   onSubmit: (inputs: SimulationInputs) => void;
+  onInputChange?: (inputs: SimulationInputs) => void;
+  liveSimulate?: boolean;
   loading?: boolean;
 }
 
-export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
+// Soroban spec XDR parameter types that carry structured / complex values.
+const COMPLEX_TYPES = ['vector', 'vec', 'struct', 'map', 'tuple', 'option', 'bytes', 'bytesn'];
+
+function isComplexType(type: string): boolean {
+  const normalized = type.toLowerCase();
+  return COMPLEX_TYPES.some((t) => normalized === t || normalized.startsWith(`${t}<`) || normalized.startsWith(`${t}(`));
+}
+
+function isNumericType(type: string): boolean {
+  return /^(u|i)(32|64|128|256)$/.test(type.toLowerCase());
+}
+
+export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = false, loading }: DynamicFormProps) {
   const [formData, setFormData] = useState<SimulationInputs>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [jsonMode, setJsonMode] = useState<Record<string, boolean>>({});
 
   const handleChange = (name: string, value: string | number | boolean) => {
-    setFormData((prev) => ({ ...prev, [name]: value }));
+    const updatedData = { ...formData, [name]: value };
+    setFormData(updatedData);
+    if (errors[name]) {
+      setErrors((prev) => {
+        const next = { ...prev };
+        delete next[name];
+        return next;
+      });
+    }
+
+    if (onInputChange || liveSimulate) {
+      // Throttle contract simulation on change through client-side simulationQueueManager (max 2/sec)
+      simulationQueueManager.enqueue(async () => {
+        if (onInputChange) {
+          onInputChange(updatedData);
+        }
+      }).catch(() => {});
+    }
   };
 
   const fieldValue = (name: string) => {
@@ -24,17 +60,64 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
     return typeof value === 'boolean' ? String(value) : value ?? '';
   };
 
+  const toggleJsonMode = (name: string) => {
+    setJsonMode((prev) => ({ ...prev, [name]: !prev[name] }));
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+
+    const newErrors: Record<string, string> = {};
+    for (const input of func.inputs) {
+      const raw = fieldValue(input.name);
+      if (!input.optional || raw !== '') {
+        if (isComplexType(input.type) && jsonMode[input.name]) {
+          try {
+            JSON.parse(String(raw));
+          } catch {
+            newErrors[input.name] = 'Invalid JSON';
+            continue;
+          }
+        }
+        const result = validateField(input.type, raw);
+        if (!result.success) {
+          newErrors[input.name] = result.error ?? 'Invalid value';
+        }
+      }
+    }
+
+    if (Object.keys(newErrors).length > 0) {
+      setErrors(newErrors);
+      return;
+    }
+
+    setErrors({});
     onSubmit(formData);
   };
+
+  function inputStyle(hasError: boolean): React.CSSProperties {
+    return {
+      padding: '8px 12px',
+      border: `1px solid ${hasError ? '#f85149' : 'var(--border-default)'}`,
+      borderRadius: '6px',
+      fontSize: '14px',
+      boxSizing: 'border-box',
+      backgroundColor: 'var(--bg-input)',
+      color: 'var(--text-primary)',
+    };
+  }
 
   return (
     <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
       {func.inputs.length === 0 ? (
-        <p style={{ color: '#8b949e', fontSize: '14px' }}>No inputs required</p>
+        <p style={{ color: 'var(--text-secondary)', fontSize: '14px' }}>No inputs required</p>
       ) : (
-        func.inputs.map((input) => (
+        func.inputs.map((input) => {
+          const hasError = !!errors[input.name];
+          const complex = isComplexType(input.type);
+          const useJson = complex && jsonMode[input.name];
+
+          return (
           <div
             key={input.name}
             style={{
@@ -47,28 +130,60 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
               style={{
                 fontSize: '14px',
                 fontWeight: '500',
-                color: '#c9d1d9',
+                color: 'var(--text-primary)',
               }}
             >
               {input.name}
               {input.optional ? (
-                <span style={{ color: '#8b949e', marginLeft: '4px' }}>(optional)</span>
+                <span style={{ color: 'var(--text-secondary)', marginLeft: '4px' }}>(optional)</span>
               ) : (
                 <span style={{ color: '#fb8500' }}>*</span>
               )}
+              <span style={{ color: 'var(--text-secondary)', marginLeft: '6px', fontSize: '12px' }}>
+                {input.type}
+              </span>
             </label>
             {input.description && (
               <p
                 style={{
                   fontSize: '12px',
-                  color: '#8b949e',
+                  color: 'var(--text-secondary)',
                   margin: '0',
                 }}
               >
                 {input.description}
               </p>
             )}
-            {input.type === 'address' ? (
+            {complex && (
+              <button
+                type="button"
+                onClick={() => toggleJsonMode(input.name)}
+                disabled={loading}
+                style={{
+                  alignSelf: 'flex-start',
+                  padding: '2px 8px',
+                  fontSize: '12px',
+                  backgroundColor: 'transparent',
+                  color: '#00d9ff',
+                  border: '1px solid var(--border-default)',
+                  borderRadius: '4px',
+                  cursor: loading ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {useJson ? 'Use structured input' : 'Use JSON input'}
+              </button>
+            )}
+            {useJson ? (
+              <textarea
+                placeholder={`Enter ${input.type} as JSON`}
+                value={fieldValue(input.name)}
+                onChange={(e) => handleChange(input.name, e.target.value)}
+                required={!input.optional}
+                disabled={loading}
+                rows={4}
+                style={{ ...inputStyle(hasError), fontFamily: 'monospace', resize: 'vertical' }}
+              />
+            ) : input.type === 'address' ? (
               <input
                 type="text"
                 placeholder="Enter Stellar address (G...)"
@@ -76,34 +191,17 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
-                style={{
-                  padding: '8px 12px',
-                  border: '1px solid #30363d',
-                  borderRadius: '6px',
-                  fontSize: '14px',
-                  fontFamily: 'monospace',
-                  boxSizing: 'border-box',
-                  backgroundColor: '#0d1117',
-                  color: '#c9d1d9',
-                }}
+                style={{ ...inputStyle(hasError), fontFamily: 'monospace' }}
               />
-            ) : input.type === 'u32' || input.type === 'u128' || input.type === 'i128' ? (
+            ) : isNumericType(input.type) ? (
               <input
-                type="number"
+                type="text"
                 placeholder={`Enter ${input.type} value`}
                 value={fieldValue(input.name)}
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
-                style={{
-                  padding: '8px 12px',
-                  border: '1px solid #30363d',
-                  borderRadius: '6px',
-                  fontSize: '14px',
-                  boxSizing: 'border-box',
-                  backgroundColor: '#0d1117',
-                  color: '#c9d1d9',
-                }}
+                style={inputStyle(hasError)}
               />
             ) : input.type === 'string' || input.type === 'symbol' ? (
               <input
@@ -113,15 +211,7 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
-                style={{
-                  padding: '8px 12px',
-                  border: '1px solid #30363d',
-                  borderRadius: '6px',
-                  fontSize: '14px',
-                  boxSizing: 'border-box',
-                  backgroundColor: '#0d1117',
-                  color: '#c9d1d9',
-                }}
+                style={inputStyle(hasError)}
               />
             ) : input.type === 'bool' ? (
               <select
@@ -129,15 +219,7 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
                 onChange={(e) => handleChange(input.name, e.target.value === 'true')}
                 required={!input.optional}
                 disabled={loading}
-                style={{
-                  padding: '8px 12px',
-                  border: '1px solid #30363d',
-                  borderRadius: '6px',
-                  fontSize: '14px',
-                  boxSizing: 'border-box',
-                  backgroundColor: '#0d1117',
-                  color: '#c9d1d9',
-                }}
+                style={inputStyle(hasError)}
               >
                 <option value="">Select value</option>
                 <option value="true">True</option>
@@ -151,19 +233,17 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
-                style={{
-                  padding: '8px 12px',
-                  border: '1px solid #30363d',
-                  borderRadius: '6px',
-                  fontSize: '14px',
-                  boxSizing: 'border-box',
-                  backgroundColor: '#0d1117',
-                  color: '#c9d1d9',
-                }}
+                style={inputStyle(hasError)}
               />
             )}
+            {hasError && (
+              <p style={{ color: '#f85149', fontSize: '12px', margin: '2px 0 0 0' }}>
+                {errors[input.name]}
+              </p>
+            )}
           </div>
-        ))
+          );
+        })
       )}
       <div style={{ display: 'flex', gap: '12px', marginTop: '8px' }}>
         <button

@@ -51,7 +51,7 @@ impl CrossChainVerifier {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().persistent().set(&DataKey::SignerCount, &0u32);
+        env.storage().instance().set(&DataKey::SignerCount, &0u32);
     }
 
     /// Admin-only: pause or unpause all verification operations.
@@ -89,8 +89,8 @@ impl CrossChainVerifier {
 
         env.storage().persistent().set(&DataKey::SignerAlgorithm(public_key.clone()), &algorithm);
 
-        let count: u32 = env.storage().persistent().get(&DataKey::SignerCount).unwrap_or(0);
-        env.storage().persistent().set(&DataKey::SignerCount, &(count + 1));
+        let count: u32 = env.storage().instance().get(&DataKey::SignerCount).unwrap_or(0);
+        env.storage().instance().set(&DataKey::SignerCount, &(count + 1));
     }
 
     pub fn remove_authorized_signer(env: Env, public_key: Bytes) {
@@ -103,9 +103,9 @@ impl CrossChainVerifier {
 
         env.storage().persistent().remove(&DataKey::SignerAlgorithm(public_key));
 
-        let count: u32 = env.storage().persistent().get(&DataKey::SignerCount).unwrap_or(0);
+        let count: u32 = env.storage().instance().get(&DataKey::SignerCount).unwrap_or(0);
         if count > 0 {
-            env.storage().persistent().set(&DataKey::SignerCount, &(count - 1));
+            env.storage().instance().set(&DataKey::SignerCount, &(count - 1));
         }
     }
 
@@ -114,7 +114,7 @@ impl CrossChainVerifier {
     }
 
     pub fn get_signer_count(env: Env) -> u32 {
-        env.storage().persistent().get(&DataKey::SignerCount).unwrap_or(0)
+        env.storage().instance().get(&DataKey::SignerCount).unwrap_or(0)
     }
 
     pub fn verify_signed_message(

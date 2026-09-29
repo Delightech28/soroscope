@@ -1,5 +1,5 @@
 use axum::{
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -25,12 +25,23 @@ pub enum AppError {
     Unauthorized(String),
 }
 
+/// RFC 7807 "Problem Details for HTTP APIs" response body.
 #[derive(Serialize, ToSchema)]
 pub struct ErrorResponse {
-    /// Error type identifier (e.g., "NOT_FOUND", "BAD_REQUEST")
-    error: String,
-    /// Human-readable error message
-    message: String,
+    /// A URI reference that identifies the problem type
+    #[schema(example = "https://soroscope.dev/errors/not-found")]
+    r#type: String,
+    /// A short, human-readable summary of the problem type
+    #[schema(example = "Not Found")]
+    title: String,
+    /// The HTTP status code for this occurrence of the problem
+    #[schema(example = 404)]
+    status: u16,
+    /// A human-readable explanation specific to this occurrence of the problem
+    detail: String,
+    /// A URI reference identifying this specific occurrence of the problem
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance: Option<String>,
 }
 
 impl AppError {
@@ -45,10 +56,19 @@ impl AppError {
 
     fn error_type(&self) -> &str {
         match self {
-            Self::Internal(_) => "INTERNAL_SERVER_ERROR",
-            Self::NotFound(_) => "NOT_FOUND",
-            Self::BadRequest(_) => "BAD_REQUEST",
-            Self::Unauthorized(_) => "UNAUTHORIZED",
+            Self::Internal(_) => "internal-server-error",
+            Self::NotFound(_) => "not-found",
+            Self::BadRequest(_) => "bad-request",
+            Self::Unauthorized(_) => "unauthorized",
+        }
+    }
+
+    fn title(&self) -> &str {
+        match self {
+            Self::Internal(_) => "Internal Server Error",
+            Self::NotFound(_) => "Not Found",
+            Self::BadRequest(_) => "Bad Request",
+            Self::Unauthorized(_) => "Unauthorized",
         }
     }
 }
@@ -57,11 +77,19 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let body = Json(ErrorResponse {
-            error: self.error_type().to_string(),
-            message: self.to_string(),
+            r#type: format!("https://soroscope.dev/errors/{}", self.error_type()),
+            title: self.title().to_string(),
+            status: status.as_u16(),
+            detail: self.to_string(),
+            instance: None,
         });
 
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/problem+json"),
+        );
+        response
     }
 }
 
@@ -112,8 +140,11 @@ impl From<SimulationError> for AppError {
             SimulationError::LocalUnavailable => AppError::Internal(
                 "Local WASM execution unavailable and no RPC fallback succeeded".to_string(),
             ),
-            SimulationError::ExecutionFailed(msg) => {
-                AppError::BadRequest(format!("Contract execution failed: {}", msg))
+            // Issue #1006: the failure is classified, so the message names the
+            // kind and, when the trap carried a `contracterror` discriminant,
+            // the resolved variant rather than a bare integer.
+            SimulationError::ExecutionFailed(failure) => {
+                AppError::BadRequest(format!("Contract execution failed: {}", failure.describe()))
             }
             SimulationError::InsufficientConsensusProviders(msg) => {
                 AppError::Internal(format!("Insufficient consensus providers: {}", msg))
@@ -121,6 +152,24 @@ impl From<SimulationError> for AppError {
             SimulationError::ConsensusMismatch(msg) => {
                 AppError::Internal(format!("Consensus mismatch: {}", msg))
             }
+        }
+    }
+}
+
+/// Convert a SAC transfer error, keeping the account name in the response so a
+/// caller can tell *which* balance is missing without re-reading the request.
+impl From<crate::sac_transfer::SacError> for AppError {
+    fn from(err: crate::sac_transfer::SacError) -> Self {
+        use crate::sac_transfer::SacError;
+        match err {
+            // Malformed input on the caller's side.
+            SacError::InvalidAccount { .. }
+            | SacError::InvalidAsset(_)
+            | SacError::InvalidNetwork(_)
+            | SacError::Xdr(_)
+            | SacError::BalanceEntryMissing { .. } => AppError::BadRequest(err.to_string()),
+            // Anything that came back from the node is a server-side problem.
+            SacError::Simulation(inner) => AppError::from(inner),
         }
     }
 }

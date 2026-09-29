@@ -1,50 +1,65 @@
 'use client';
 
-import React from "react"
-
-import { useState } from 'react';
-import type { ContractFunction } from '../lib/sorobantypes';
+import React, { useState } from 'react';
 import { Loader2 } from 'lucide-react';
+import type { ContractFunction, SimulationInputs } from '../lib/sorobantypes';
+import { useTransactionToasts } from './ToastViewport';
 
 interface DynamicFormProps {
   func: ContractFunction;
-  onSubmit: (inputs: Record<string, any>) => void;
+  onSubmit: (inputs: SimulationInputs) => Promise<unknown> | void;
   loading?: boolean;
 }
 
 export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
-  const [formData, setFormData] = useState<Record<string, any>>({});
+  const [formData, setFormData] = useState<SimulationInputs>({});
+  const { showToast } = useTransactionToasts();
 
-  const handleChange = (name: string, value: any) => {
+  const handleChange = (name: string, value: string | number | boolean) => {
     setFormData((prev) => ({ ...prev, [name]: value }));
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    onSubmit(formData);
+  const fieldValue = (name: string) => {
+    const value = formData[name];
+    return typeof value === 'boolean' ? String(value) : value ?? '';
+  };
+
+  const handleSubmit = async (event: React.FormEvent, mode: 'simulate' | 'invoke' = 'simulate') => {
+    event.preventDefault();
+    if (loading) {
+      return;
+    }
+
+    if (mode === 'invoke') {
+      showToast({ phase: 'signing', message: 'Please review and approve the transaction in your wallet.' });
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+      showToast({ phase: 'submitting', message: 'Broadcasting the transaction to the network.' });
+
+      try {
+        const result = await Promise.resolve(onSubmit(formData));
+        const txHash =
+          typeof result === 'object' && result !== null && 'result' in result &&
+          typeof (result as { result?: { transaction_hash?: string } }).result?.transaction_hash === 'string'
+            ? (result as { result: { transaction_hash: string } }).result.transaction_hash
+            : undefined;
+        showToast({ phase: 'success', message: 'Transaction completed successfully.', txHash });
+      } catch (error) {
+        showToast({ phase: 'failed', message: error instanceof Error ? error.message : 'The transaction could not be completed.' });
+      }
+      return;
+    }
+
+    await Promise.resolve(onSubmit(formData));
   };
 
   return (
-    <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+    <form onSubmit={(event) => void handleSubmit(event, 'simulate')} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
       {func.inputs.length === 0 ? (
         <p style={{ color: '#8b949e', fontSize: '14px' }}>No inputs required</p>
       ) : (
         func.inputs.map((input) => (
-          <div
-            key={input.name}
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '4px',
-            }}
-          >
-            <label
-              style={{
-                fontSize: '14px',
-                fontWeight: '500',
-                color: '#c9d1d9',
-              }}
-            >
+          <div key={input.name} style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+            <label style={{ fontSize: '14px', fontWeight: '500', color: '#c9d1d9' }}>
               {input.name}
               {input.optional ? (
                 <span style={{ color: '#8b949e', marginLeft: '4px' }}>(optional)</span>
@@ -53,21 +68,13 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
               )}
             </label>
             {input.description && (
-              <p
-                style={{
-                  fontSize: '12px',
-                  color: '#8b949e',
-                  margin: '0',
-                }}
-              >
-                {input.description}
-              </p>
+              <p style={{ fontSize: '12px', color: '#8b949e', margin: '0' }}>{input.description}</p>
             )}
             {input.type === 'address' ? (
               <input
                 type="text"
                 placeholder="Enter Stellar address (G...)"
-                value={formData[input.name] || ''}
+                value={fieldValue(input.name)}
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
@@ -86,7 +93,7 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
               <input
                 type="number"
                 placeholder={`Enter ${input.type} value`}
-                value={formData[input.name] || ''}
+                value={fieldValue(input.name)}
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
@@ -104,7 +111,7 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
               <input
                 type="text"
                 placeholder={`Enter ${input.type}`}
-                value={formData[input.name] || ''}
+                value={fieldValue(input.name)}
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
@@ -120,7 +127,7 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
               />
             ) : input.type === 'bool' ? (
               <select
-                value={formData[input.name] === undefined ? '' : formData[input.name]}
+                value={formData[input.name] === undefined ? '' : String(formData[input.name])}
                 onChange={(e) => handleChange(input.name, e.target.value === 'true')}
                 required={!input.optional}
                 disabled={loading}
@@ -142,7 +149,7 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
               <input
                 type="text"
                 placeholder="Enter value"
-                value={formData[input.name] || ''}
+                value={fieldValue(input.name)}
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
@@ -192,6 +199,7 @@ export function DynamicForm({ func, onSubmit, loading }: DynamicFormProps) {
         <button
           type="button"
           disabled={loading}
+          onClick={(event) => void handleSubmit(event, 'invoke')}
           style={{
             padding: '10px 20px',
             backgroundColor: loading ? '#30363d' : '#a371f7',

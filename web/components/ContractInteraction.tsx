@@ -16,10 +16,10 @@ export const ContractInteraction: React.FC<ContractInteractionProps> = ({
     return (
         <div
             style={{
-                backgroundColor: '#161b22',
+                backgroundColor: 'var(--bg-card)',
                 borderRadius: '8px',
                 padding: '24px',
-                border: '1px solid #30363d',
+                border: '1px solid var(--border-default)',
             }}
         >
             <h2

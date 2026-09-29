@@ -24,6 +24,24 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use stellar_strkey::Strkey;
 use utoipa::ToSchema;
+use std::collections::HashMap;
+use moka::sync::Cache;
+use std::time::Duration;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ApiTier {
+    Free,
+    Pro,
+}
+
+impl ApiTier {
+    pub fn rate_limit_per_minute(&self) -> u64 {
+        match self {
+            ApiTier::Free => 100,
+            ApiTier::Pro => 1000,
+        }
+    }
+}
 
 const CHALLENGE_EXPIRY_SECS: u64 = 300;
 const JWT_EXPIRY_SECS: u64 = 86400;
@@ -40,6 +58,8 @@ pub struct AuthState {
     /// Emergency pause flag for message verification.
     /// When true, all verification endpoints reject requests.
     pub emergency_verification_paused: Arc<AtomicBool>,
+    pub api_keys: HashMap<String, ApiTier>,
+    pub rate_limiter: Cache<String, u64>,
 }
 
 impl AuthState {
@@ -49,6 +69,13 @@ impl AuthState {
         network_passphrase: String,
         emergency_verification_paused: bool,
     ) -> Self {
+        let mut api_keys = HashMap::new();
+        // Dummy stored key hashes for testing
+        api_keys.insert("hash_free_key".to_string(), ApiTier::Free);
+        api_keys.insert("hash_pro_key".to_string(), ApiTier::Pro);
+        let rate_limiter = Cache::builder()
+            .time_to_live(Duration::from_secs(60))
+            .build();
         let seed = match sep10_seed {
             Some(seed) => seed,
             None => {
@@ -89,6 +116,8 @@ impl AuthState {
             server_public_key,
             network_passphrase,
             emergency_verification_paused: Arc::new(AtomicBool::new(emergency_verification_paused)),
+            api_keys,
+            rate_limiter,
         }
     }
 
@@ -152,12 +181,14 @@ struct Claims {
     exp: u64,
     iat: u64,
     scopes: Vec<String>,
+    #[serde(default)]
+    roles: Vec<String>,
 }
 
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }
 
@@ -224,7 +255,9 @@ fn build_challenge_envelope(
     let hash = tx_hash(&tx, &net_id)?;
     let sig = state.signing_key.sign(&hash);
 
-    let hint: [u8; 4] = state.server_public_key[28..32].try_into().unwrap();
+    let hint: [u8; 4] = state.server_public_key[28..32]
+        .try_into()
+        .map_err(|_| AppError::Internal("invalid server public key length".into()))?;
     let decorated = DecoratedSignature {
         hint: SignatureHint(hint),
         signature: sig
@@ -325,8 +358,12 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
     let hash = tx_hash(&inner.tx, &net_id)?;
 
     let sigs: &[DecoratedSignature] = inner.signatures.as_ref();
-    let server_hint: [u8; 4] = state.server_public_key[28..32].try_into().unwrap();
-    let client_hint: [u8; 4] = client_key[28..32].try_into().unwrap();
+    let server_hint: [u8; 4] = state.server_public_key[28..32]
+        .try_into()
+        .map_err(|_| AppError::Internal("invalid server public key length".into()))?;
+    let client_hint: [u8; 4] = client_key[28..32]
+        .try_into()
+        .map_err(|_| AppError::BadRequest("invalid client public key length".into()))?;
 
     let mut server_ok = false;
     let mut client_ok = false;
@@ -374,6 +411,7 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
         iat: now,
         exp: now + JWT_EXPIRY_SECS,
         scopes: vec!["simulate".to_string()],
+        roles: vec!["user".to_string()],
     };
 
     let header = Header::new(Algorithm::RS256);
@@ -478,30 +516,65 @@ pub async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    // Check if verification is paused — deny all requests during emergency maintenance
     if state.is_verification_paused() {
         return Err(AppError::Internal(
             "Authentication is temporarily paused for emergency maintenance".into(),
         ));
     }
 
+    // Check for API Key first (Issue #32)
+    if let Some(api_key) = req.headers().get("X-API-Key").and_then(|v| v.to_str().ok()) {
+        // Hash the provided API key to check against stored hashes
+        let mut hasher = Sha256::new();
+        hasher.update(api_key.as_bytes());
+        let hash_hex = hex::encode(hasher.finalize());
+        
+        let tier = state.api_keys.get(&hash_hex).or_else(|| state.api_keys.get(api_key)).ok_or_else(|| {
+            AppError::Unauthorized("Invalid API Key".into())
+        })?;
+
+        // Rate limiting
+        let limit = tier.rate_limit_per_minute();
+        // Just use the API key string or hash as the rate limit key
+        let cache_key = format!("{}-{}", hash_hex.clone(), now_secs() / 60);
+        
+        // Simple atomic counter increment using moka
+        let count = state.rate_limiter.get_with(cache_key.clone(), || 0);
+        if count >= limit {
+            return Err(AppError::Unauthorized("Rate limit exceeded".into()));
+        }
+        state.rate_limiter.insert(cache_key, count + 1);
+
+        return Ok(next.run(req).await);
+    }
+
+    // Fallback to JWT (Issue #31)
     let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| AppError::Unauthorized("Missing Authorization header".into()))?;
+        .ok_or_else(|| AppError::Unauthorized("Missing Authorization or X-API-Key header".into()))?;
 
     let token = auth_header
         .strip_prefix("Bearer ")
         .ok_or_else(|| AppError::Unauthorized("Expected Bearer token".into()))?;
 
-    let validation = Validation::new(Algorithm::RS256);
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.validate_exp = true;
+
     let token_data = decode::<Claims>(token, &state.decoding_key, &validation)
         .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
 
     if !token_data.claims.scopes.contains(&"simulate".to_string()) {
         return Err(AppError::Unauthorized(
             "Missing required scope 'simulate'".into(),
+        ));
+    }
+
+    // Role validation from claims
+    if !token_data.claims.roles.contains(&"admin".to_string()) && !token_data.claims.roles.contains(&"user".to_string()) {
+        return Err(AppError::Unauthorized(
+            "Missing required roles".into(),
         ));
     }
 

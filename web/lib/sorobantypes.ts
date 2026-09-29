@@ -1,4 +1,13 @@
-export type SorobanType = 'address' | 'u32' | 'i128' | 'u128' | 'string' | 'symbol' | 'bool' | 'struct' | 'enum';
+export type SorobanType =
+  | 'address'
+  | 'u32'
+  | 'i128'
+  | 'u128'
+  | 'string'
+  | 'symbol'
+  | 'bool'
+  | 'struct'
+  | 'enum';
 
 /** Typed map of contract function input values from the simulation form. */
 export type SimulationInputs = Record<string, string | number | boolean>;
@@ -44,7 +53,8 @@ export interface InvocationResult {
   inputs: SimulationInputs;
   result?: unknown;
   error?: string;
-  errorType?: string; // Error type from backend (e.g., BAD_REQUEST, INTERNAL_SERVER_ERROR)
+  /** Error type from backend (e.g., BAD_REQUEST, INTERNAL_SERVER_ERROR) */
+  errorType?: string;
   /** Primary `/analyze` response payload for the latest invocation. */
   analysisReport?: ResourceReport;
   /** Backward-compatible alias for older stored history entries. */
@@ -60,6 +70,15 @@ export interface CallNode {
   contract_id: string;
   function: string;
   children: CallNode[];
+  /**
+   * Gas attributed to this call. Optional because graphs produced before the
+   * backend reported per-call gas do not carry it; the visualizer renders
+   * those edges neutrally rather than implying they were free.
+   */
+  gas_used?: number | null;
+  /** Decoded call arguments, when the backend supplies them. */
+  args?: unknown[];
+  return_value?: unknown;
 }
 
 export interface CallGraph {
@@ -112,6 +131,7 @@ export interface SimulationStateSnapshot {
 
 export interface ResourceReport extends SorobanResources {
   cost_stroops: number;
+  testnet_averages?: TestnetAverages;
   state_dependency: StateDependencyReport[] | null;
   ttl_analysis: TtlAnalysisApiReport | null;
   nutrition: NutritionReport;
@@ -119,7 +139,6 @@ export interface ResourceReport extends SorobanResources {
   call_graph_mermaid: string | null;
   state_snapshot: SimulationStateSnapshot | null;
   protocol_version: number;
-  testnet_averages?: TestnetAverages;
 }
 
 export type AnalyzeResponse = ResourceReport;
@@ -163,12 +182,47 @@ export const MOCK_CONTRACT_FUNCTIONS: ContractFunction[] = [
 export function generateMockResult(functionName: string, inputs: SimulationInputs): unknown {
   const results: Record<string, unknown> = {
     transfer: { success: true, transaction_hash: '0x' + Math.random().toString(16).slice(2) },
-    balance: Math.floor(Math.random() * 1000000),
+    balance: Math.floor(Math.random() * 1_000_000),
     mint: { success: true, amount_minted: inputs.amount },
     symbol: 'USDC',
     decimals: 6,
   };
   return results[functionName] ?? { success: true, message: 'Function executed' };
+}
+
+export type TransactionStatus = 'success' | 'failed' | 'pending';
+
+export interface TransactionRecord {
+  hash: string;
+  functionName: string;
+  status: TransactionStatus;
+  timestamp: number;
+  contractId: string;
+  fee?: string;
+}
+
+export function generateMockTransactionRecord(overrides?: Partial<TransactionRecord>): TransactionRecord {
+  return {
+    hash: overrides?.hash ?? 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b',
+    functionName: overrides?.functionName ?? 'transfer',
+    status: overrides?.status ?? 'success',
+    timestamp: overrides?.timestamp ?? Date.now(),
+    contractId: overrides?.contractId ?? 'CAEZJVJ4N7P7GRUVD5NG5LYYH23AQHJUKQEUHW54LR5PGQX3V7FXD7Q',
+    fee: overrides?.fee ?? '0.00123',
+  };
+}
+
+export function generateMockTransactions(count: number): TransactionRecord[] {
+  const statuses: TransactionStatus[] = ['success', 'failed', 'pending'];
+  const functions = ['transfer', 'swap', 'mint', 'burn', 'deposit', 'withdraw', 'approve'];
+  return Array.from({ length: count }, (_, i) => ({
+    hash: `tx${String(i).padStart(3, '0')}${'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b'.slice(5)}`,
+    functionName: functions[i % functions.length],
+    status: statuses[i % statuses.length],
+    timestamp: Date.now() - i * 60000,
+    contractId: 'CAEZJVJ4N7P7GRUVD5NG5LYYH23AQHJUKQEUHW54LR5PGQX3V7FXD7Q',
+    fee: (Math.random() * 0.01).toFixed(5),
+  }));
 }
 
 export function generateMockResourceCost(): ResourceCost {
@@ -181,3 +235,27 @@ export function generateMockResourceCost(): ResourceCost {
     transaction_size_bytes: Math.floor(Math.random() * 2 * 1024),
   };
 }
+
+export interface FeeBumpOption {
+  label: string;
+  multiplier: number;
+  feeStroops: number;
+  feeXlm: string;
+  description: string;
+}
+
+export interface FeeEstimate {
+  minResourceFeeStroops: number;
+  classicFeeStroops: number;
+  totalFeeStroops: number;
+  totalFeeXlm: string;
+  feeBumps: FeeBumpOption[];
+  networkFees: {
+    low: number;
+    medium: number;
+    high: number;
+  };
+  surgeMultiplier: number;
+}
+
+export type FeeBumpLevel = 'low' | 'medium' | 'high';

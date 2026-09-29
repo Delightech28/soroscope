@@ -66,6 +66,8 @@ pub enum Error {
     InsufficientDeposit = 10,
     /// Borrow (flash loan) is paused.
     BorrowPaused = 11,
+    /// Receiver contract does not implement the FlashLoanReceiver interface.
+    InvalidReceiver = 12,
 }
 
 // ── Event types ──────────────────────────────────────────────────────────────
@@ -447,6 +449,11 @@ impl FlashLoanVault {
         // 4. Auth: the initiator must have signed.
         initiator.require_auth();
 
+        // 4b. Verify receiver implements the flash loan callback interface.
+        if !receiver.is_contract() {
+            return Err(Error::InvalidReceiver);
+        }
+
         let token_addr = load_token(&e)?;
         let token = soroban_sdk::token::Client::new(&e, &token_addr);
 
@@ -468,7 +475,13 @@ impl FlashLoanVault {
 
         // 9. Call the receiver's callback so it can use the funds.
         let receiver_client = FlashLoanReceiverClient::new(&e, &receiver);
-        receiver_client.execute_operation(&token_addr, &amount, &fee, &initiator);
+        if receiver_client
+            .try_execute_operation(&token_addr, &amount, &fee, &initiator)
+            .is_err()
+        {
+            set_flash_loan_active(&e, false);
+            return Err(Error::InvalidReceiver);
+        }
 
         // 10. Verify repayment: after lending `amount`, the receiver must
         // return `amount + fee`, leaving the vault with its original balance
@@ -550,13 +563,27 @@ impl FlashLoanVault {
 
         // 8. Call borrower's callback so it can use the funds and repay.
         let receiver_client = FlashLoanReceiverClient::new(&e, &borrower);
-        receiver_client.execute_operation(&token_addr, &amount, &fee, &borrower);
+        if receiver_client
+            .try_execute_operation(&token_addr, &amount, &fee, &borrower)
+            .is_err()
+        {
+            set_flash_loan_active(&e, false);
+            e.storage().instance().set(
+                &DataKey::BorrowRecord(borrower.clone()),
+                &BorrowRecord { fee: 0, total_repayment: 0 },
+            );
+            return Err(Error::InvalidReceiver);
+        }
 
         // 9. Verify repayment: vault balance must be >= pre_balance + fee.
         let post_balance = token.balance(&e.current_contract_address());
         if post_balance < pre_balance + fee {
-            // Revert with a clear error.
-            panic!("borrow not repaid");
+            set_flash_loan_active(&e, false);
+            e.storage().instance().set(
+                &DataKey::BorrowRecord(borrower.clone()),
+                &BorrowRecord { fee: 0, total_repayment: 0 },
+            );
+            return Err(Error::LoanNotRepaid);
         }
 
         // 10. Clear reentrancy guard and borrow record.

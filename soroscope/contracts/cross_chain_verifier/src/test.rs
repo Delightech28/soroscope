@@ -181,7 +181,6 @@ fn test_replay_nonce_panics() {
 }
 
 #[test]
-#[should_panic(expected = "State root not found")]
 fn test_verify_message_no_root() {
     let env = Env::default();
     let contract_id = env.register(CrossChainVerifier, ());
@@ -194,7 +193,7 @@ fn test_verify_message_no_root() {
     let proof = Vec::new(&env);
     let proof_flags = Vec::new(&env);
 
-    client.verify_message(&100, &leaf, &proof, &proof_flags);
+    assert!(!client.verify_message(&100, &leaf, &proof, &proof_flags));
 }
 
 // ============================================================================

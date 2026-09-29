@@ -4,9 +4,11 @@ use crate::simulation::{SimulationResult, SimulationError, SorobanResources};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use soroban_sdk::xdr::{Limits, SorobanTransactionData, ReadXdr};
 
+#[allow(dead_code)]
 pub struct SimulationEngine<P, C, R> {
     provider: P,
     cache: C,
+    #[allow(dead_code)]
     parser: R,
 }
 
@@ -81,6 +83,7 @@ where
             transaction_hash: None,
             latest_ledger: rpc_result.latest_ledger,
             cost_stroops,
+            rent_bytes: None,
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: rpc_result.transaction_data,

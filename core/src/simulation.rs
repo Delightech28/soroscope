@@ -70,8 +70,15 @@ pub enum SimulationError {
 
     /// The contract ran locally but failed during execution (host error,
     /// panic, budget exhaustion, malformed WASM).
-    #[error("Contract execution failed: {0}")]
-    ExecutionFailed(String),
+    ///
+    /// The payload is structured rather than a bare string (issue #1006): a
+    /// CPU limit, a memory limit, a storage failure, an auth rejection and a
+    /// contract trap all used to collapse into the same message, which left
+    /// the author no way to tell whether to raise the instruction limit,
+    /// shrink a `Vec`, fix an authorisation check, or repair a panic. The
+    /// original diagnostic is preserved verbatim inside the payload.
+    #[error("Contract execution failed: {}", .0.describe())]
+    ExecutionFailed(crate::failure::ExecutionFailure),
 
     #[error("Insufficient consensus providers: {0}")]
     InsufficientConsensusProviders(String),
@@ -91,17 +98,128 @@ impl SimulationError {
     pub fn is_retriable(&self) -> bool {
         matches!(self, SimulationError::LocalUnavailable)
     }
+
+    /// Attach the contract and function this error came from (#1006).
+    ///
+    /// Only `ExecutionFailed` carries a location; every other variant already
+    /// names its own cause, and leaving them untouched keeps `is_retriable`
+    /// and the error text exactly as they were.
+    pub fn with_invocation(
+        mut self,
+        contract_id: Option<String>,
+        function: Option<&str>,
+    ) -> Self {
+        if let SimulationError::ExecutionFailed(failure) = &mut self {
+            *failure = failure.clone().with_invocation(contract_id, function);
+        }
+        self
+    }
 }
 
 /// Map `soroban-env-host` errors onto `SimulationError` so local-runner
 /// failures surface with the same error type as RPC failures.
 ///
-/// All host errors collapse to `ExecutionFailed` — the distinction between
-/// a budget overrun, an XDR decode glitch, and a contract trap is useful
-/// for debugging but carries no retry meaning at the API boundary.
+/// Every host error is *classified* rather than collapsed (issue #1006): the
+/// kind, and any `contracterror` discriminant the diagnostic carries, are
+/// recovered so callers can act on the distinction. The retry meaning is
+/// deliberately unchanged — `is_retriable()` remains false for every kind,
+/// because a contract-level failure is terminal whether it was a budget
+/// overrun or a panic.
 impl From<soroban_env_host::HostError> for SimulationError {
     fn from(e: soroban_env_host::HostError) -> Self {
-        SimulationError::ExecutionFailed(format!("{e:?}"))
+        SimulationError::ExecutionFailed(crate::failure::ExecutionFailure::from_diagnostic(format!("{e:?}")))
+    }
+}
+
+/// Ordered entry in a ledger key access trace.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct LedgerAccessEntry {
+    pub ordinal: usize,
+    pub key: String,
+    pub durability: String,
+    pub access_type: String,
+}
+
+/// Analysis summary for a single ledger key accessed during invocation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct KeyAccessAnalysis {
+    pub key: String,
+    pub durability: String,
+    pub read_count: usize,
+    pub write_count: usize,
+    pub multiple_writes: bool,
+    pub read_after_write: bool,
+}
+
+/// Ordered access trace report identifying repeated reads/writes of ledger keys.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct LedgerAccessTraceReport {
+    pub status: String,
+    pub access_list: Vec<LedgerAccessEntry>,
+    pub analyzed_keys: Vec<KeyAccessAnalysis>,
+    pub flagged_keys: Vec<KeyAccessAnalysis>,
+}
+
+pub fn analyze_ledger_access_trace(entries: &[LedgerAccessEntry]) -> LedgerAccessTraceReport {
+    if entries.is_empty() {
+        return LedgerAccessTraceReport {
+            status: "unavailable".to_string(),
+            access_list: vec![],
+            analyzed_keys: vec![],
+            flagged_keys: vec![],
+        };
+    }
+
+    let mut key_order: Vec<String> = Vec::new();
+    let mut key_map: std::collections::HashMap<String, KeyAccessAnalysis> = std::collections::HashMap::new();
+
+    for entry in entries {
+        if !key_map.contains_key(&entry.key) {
+            key_order.push(entry.key.clone());
+            key_map.insert(
+                entry.key.clone(),
+                KeyAccessAnalysis {
+                    key: entry.key.clone(),
+                    durability: entry.durability.clone(),
+                    read_count: 0,
+                    write_count: 0,
+                    multiple_writes: false,
+                    read_after_write: false,
+                },
+            );
+        }
+
+        let analysis = key_map.get_mut(&entry.key).unwrap();
+        if entry.access_type == "read" {
+            analysis.read_count += 1;
+            if analysis.write_count > 0 {
+                analysis.read_after_write = true;
+            }
+        } else if entry.access_type == "write" {
+            analysis.write_count += 1;
+            if analysis.write_count > 1 {
+                analysis.multiple_writes = true;
+            }
+        }
+    }
+
+    let mut analyzed_keys = Vec::new();
+    let mut flagged_keys = Vec::new();
+
+    for key in key_order {
+        if let Some(analysis) = key_map.remove(&key) {
+            if analysis.multiple_writes || analysis.read_after_write {
+                flagged_keys.push(analysis.clone());
+            }
+            analyzed_keys.push(analysis);
+        }
+    }
+
+    LedgerAccessTraceReport {
+        status: "available".to_string(),
+        access_list: entries.to_vec(),
+        analyzed_keys,
+        flagged_keys,
     }
 }
 
@@ -118,6 +236,138 @@ pub struct SorobanResources {
     pub ledger_write_bytes: u64,
     /// Transaction size in bytes
     pub transaction_size_bytes: u64,
+    /// Concentrated AMM tick crossing profile report
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amm_tick_profile_report: Option<ConcentratedAmmTickProfileReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct NetworkLimits {
+    pub max_cpu_instructions: u64,
+    pub max_read_entries: u32,
+    pub max_write_entries: u32,
+}
+
+impl Default for NetworkLimits {
+    fn default() -> Self {
+        Self {
+            max_cpu_instructions: 100_000_000,
+            max_read_entries: 40,
+            max_write_entries: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct HeadroomMetrics {
+    pub cpu_headroom_pct: u32,
+    pub read_entries_headroom_pct: u32,
+    pub write_entries_headroom_pct: u32,
+    pub limiting_dimension: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SwapTickMeasurement {
+    pub ticks_crossed: usize,
+    pub cpu_instructions: u64,
+    pub read_entries: u32,
+    pub write_entries: u32,
+    pub headroom: HeadroomMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ConcentratedAmmTickProfileReport {
+    pub status: String,
+    pub measurements: Vec<SwapTickMeasurement>,
+    pub max_supported_ticks: usize,
+    pub warning_insight: Option<String>,
+}
+
+pub fn profile_concentrated_amm_ticks(
+    measurements_raw: &[(usize, u64, u32, u32)],
+    limits: Option<NetworkLimits>,
+) -> Result<ConcentratedAmmTickProfileReport, String> {
+    let limits = limits.unwrap_or_default();
+
+    if measurements_raw.is_empty() {
+        return Err("No tick measurements provided".to_string());
+    }
+
+    for i in 1..measurements_raw.len() {
+        if measurements_raw[i].2 < measurements_raw[i - 1].2 {
+            return Err(format!(
+                "Non-monotonic read entries detected: step {} had {} reads < step {} with {} reads",
+                i, measurements_raw[i].2, i - 1, measurements_raw[i - 1].2
+            ));
+        }
+    }
+
+    let mut measurements = Vec::new();
+    let mut max_supported_ticks = 0;
+    let mut limiting_tick_count = None;
+
+    for &(ticks, cpu, reads, writes) in measurements_raw {
+        let cpu_used_pct = ((cpu as f64 / limits.max_cpu_instructions as f64) * 100.0) as u32;
+        let read_used_pct = ((reads as f64 / limits.max_read_entries as f64) * 100.0) as u32;
+        let write_used_pct = ((writes as f64 / limits.max_write_entries as f64) * 100.0) as u32;
+
+        let cpu_headroom_pct = 100saturating_sub(cpu_used_pct);
+        let read_headroom_pct = 100saturating_sub(read_used_pct);
+        let write_headroom_pct = 100saturating_sub(write_used_pct);
+
+        let mut limiting_dim = None;
+        if read_used_pct >= 90 {
+            limiting_dim = Some("read_entries".to_string());
+        } else if cpu_used_pct >= 90 {
+            limiting_dim = Some("cpu_instructions".to_string());
+        } else if write_used_pct >= 90 {
+            limiting_dim = Some("write_entries".to_string());
+        }
+
+        if reads <= limits.max_read_entries
+            && cpu <= limits.max_cpu_instructions
+            && writes <= limits.max_write_entries
+        {
+            max_supported_ticks = ticks;
+        } else if limiting_tick_count.is_none() {
+            limiting_tick_count = Some(ticks);
+        }
+
+        measurements.push(SwapTickMeasurement {
+            ticks_crossed: ticks,
+            cpu_instructions: cpu,
+            read_entries: reads,
+            write_entries: writes,
+            headroom: HeadroomMetrics {
+                cpu_headroom_pct,
+                read_entries_headroom_pct: read_headroom_pct,
+                write_entries_headroom_pct: write_headroom_pct,
+                limiting_dimension: limiting_dim,
+            },
+        });
+    }
+
+    let warning_insight = if let Some(&last) = measurements_raw.last() {
+        let next_doubling_ticks = last.0 * 2;
+        let estimated_next_reads = last.2 * 2;
+        if estimated_next_reads > limits.max_read_entries {
+            Some(format!(
+                "Next doubling to {} ticks would exceed read-entry limit ({}); max supported ticks is {}",
+                next_doubling_ticks, limits.max_read_entries, max_supported_ticks
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(ConcentratedAmmTickProfileReport {
+        status: "success".to_string(),
+        measurements,
+        max_supported_ticks,
+        warning_insight,
+    })
 }
 
 /// Per-function instruction profiling result
@@ -176,6 +426,101 @@ pub fn estimate_resource_fee_stroops(resources: &SorobanResources) -> u64 {
     cpu_cost
         .saturating_add(ram_cost)
         .saturating_add(ledger_cost)
+}
+
+/// Result of a batched simulation snapshot ledger hydration operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotHydrationReport {
+    pub total_keys_requested: usize,
+    pub cache_hits: usize,
+    pub rpc_calls_made: usize,
+    pub fetched_entries: HashMap<String, String>,
+    pub missing_keys: Vec<String>,
+}
+
+/// Batched ledger hydrator for simulation state snapshots and TTL analysis reports.
+#[derive(Debug, Clone)]
+pub struct BatchedLedgerHydrator {
+    pub batch_size: usize,
+}
+
+impl Default for BatchedLedgerHydrator {
+    fn default() -> Self {
+        Self { batch_size: 100 }
+    }
+}
+
+impl BatchedLedgerHydrator {
+    pub fn new(batch_size: usize) -> Self {
+        Self { batch_size }
+    }
+
+    /// Hydrate simulation snapshot keys using cache lookup and batched RPC calls.
+    pub async fn hydrate<F, Fut>(
+        &self,
+        keys: &[String],
+        ledger_sequence: u64,
+        cache_lookup: impl Fn(&str, u64) -> Option<String>,
+        rpc_fetch_batch: F,
+    ) -> SnapshotHydrationReport
+    where
+        F: Fn(Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<HashMap<String, String>, String>>,
+    {
+        if keys.is_empty() {
+            return SnapshotHydrationReport {
+                total_keys_requested: 0,
+                cache_hits: 0,
+                rpc_calls_made: 0,
+                fetched_entries: HashMap::new(),
+                missing_keys: vec![],
+            };
+        }
+
+        let mut fetched_entries = HashMap::new();
+        let mut missing_keys = Vec::new();
+        let mut keys_to_fetch = Vec::new();
+        let mut cache_hits = 0;
+
+        for key in keys {
+            if let Some(cached_xdr) = cache_lookup(key, ledger_sequence) {
+                cache_hits += 1;
+                fetched_entries.insert(key.clone(), cached_xdr);
+            } else {
+                keys_to_fetch.push(key.clone());
+            }
+        }
+
+        let mut rpc_calls_made = 0;
+
+        for chunk in keys_to_fetch.chunks(self.batch_size) {
+            rpc_calls_made += 1;
+            match rpc_fetch_batch(chunk.to_vec()).await {
+                Ok(batch_results) => {
+                    for key in chunk {
+                        if let Some(entry_xdr) = batch_results.get(key) {
+                            fetched_entries.insert(key.clone(), entry_xdr.clone());
+                        } else {
+                            missing_keys.push(key.clone());
+                        }
+                    }
+                }
+                Err(_) => {
+                    for key in chunk {
+                        missing_keys.push(key.clone());
+                    }
+                }
+            }
+        }
+
+        SnapshotHydrationReport {
+            total_keys_requested: keys.len(),
+            cache_hits,
+            rpc_calls_made,
+            fetched_entries,
+            missing_keys,
+        }
+    }
 }
 
 // ── WasmInstrumenter ─────────────────────────────────────────────────────────
@@ -864,6 +1209,11 @@ pub struct SimulationResult {
     pub transaction_hash: Option<String>,
     pub latest_ledger: u64,
     pub cost_stroops: u64,
+    /// Rent charged by the simulation, in bytes of rent. Absent on
+    /// pre-protocol-20 nodes, and unusable for a refund estimate without a
+    /// durability split, so it is optional and never defaulted to zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rent_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_dependency: Option<Vec<StateDependency>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1102,7 +1452,7 @@ struct RpcError {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct SimulationRpcResult {
+pub struct SimulationRpcResult {
     #[serde(default)]
     transaction_data: String,
     #[serde(default)]
@@ -1122,7 +1472,59 @@ struct SimulationRpcResult {
 struct ResourceCost {
     cpu_insns: String,
     mem_bytes: String,
+    /// Total rent charged. Present on protocol >= 20 RPCs; absent on older
+    /// nodes, which is why it is an `Option` all the way through.
+    #[serde(default)]
+    rent_bytes: Option<String>,
 }
+
+#[allow(dead_code)]
+/// Extracts Soroban host budget limits from CLI log output.
+///
+/// Soroban CLI v21 changed the budget line from the legacy
+/// `budget: instructions: <cpu>, memory: <mem>` format to
+/// `budget: cpu: <cpu>, mem: <mem>`. Some RPC cost logs use
+/// `cost: cpu_insns: <cpu>, mem_bytes: <mem>` as well. This parser
+/// accepts all three formats and returns `(cpu_instructions, ram_bytes)`.
+fn extract_soroban_budget_limits(log: &str) -> Option<(u64, u64)> {
+    let budget_line = log.lines().find(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("budget") || lower.contains("cpu_insns") || lower.contains("mem_bytes")
+    })?;
+
+    let cpu_patterns = [
+        r"\binstructions\b[^\d]*(\d+)",
+        r"\bcpu\b[^\d]*(\d+)",
+        r"\bcpu_insns\b[^\d]*(\d+)",
+    ];
+    let mem_patterns = [
+        r"\bmemory\b[^\d]*(\d+)",
+        r"\bmem\b[^\d]*(\d+)",
+        r"\bmem_bytes\b[^\d]*(\d+)",
+    ];
+
+    let cpu = cpu_patterns.iter().find_map(|pattern| {
+        regex::Regex::new(pattern)
+            .ok()?
+            .captures(budget_line)?
+            .get(1)?
+            .as_str()
+            .parse()
+            .ok()
+    })?;
+    let mem = mem_patterns.iter().find_map(|pattern| {
+        regex::Regex::new(pattern)
+            .ok()?
+            .captures(budget_line)?
+            .get(1)?
+            .as_str()
+            .parse()
+            .ok()
+    })?;
+
+    Some((cpu, mem))
+}
+
 // ── Multi-account authorization ───────────────────────────────────────────────
 
 /// Represents one signer in a multi-account authorization scenario.
@@ -1193,6 +1595,7 @@ pub struct SimulationEngine {
     contract_cache: Option<Arc<crate::cache::ContractCache>>,
     mode: SimulationMode,
     local_runner: Option<Arc<crate::runner::LocalRunner>>,
+    rpc_throttle: crate::rpc_throttle::RpcThrottle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1235,6 +1638,7 @@ impl SimulationEngine {
             contract_cache: None,
             mode: SimulationMode::Failover,
             local_runner: None,
+            rpc_throttle: Default::default(),
         }
     }
 
@@ -1253,6 +1657,7 @@ impl SimulationEngine {
             contract_cache: None,
             mode,
             local_runner: None,
+            rpc_throttle: Default::default(),
         }
     }
 
@@ -1269,6 +1674,7 @@ impl SimulationEngine {
             contract_cache: Some(cache),
             mode: SimulationMode::Failover,
             local_runner: None,
+            rpc_throttle: Default::default(),
         }
     }
 
@@ -1294,6 +1700,7 @@ impl SimulationEngine {
             contract_cache: None,
             mode,
             local_runner: None,
+            rpc_throttle: Default::default(),
         }
     }
 
@@ -1379,9 +1786,10 @@ impl SimulationEngine {
         if let (Some(header), Some(value)) = (auth_header.as_deref(), auth_value.as_deref()) {
             req_builder = req_builder.header(header, value);
         }
-        let response: GetLedgerEntriesResponse = req_builder
-            .send()
-            .await?
+        self.rpc_throttle.wait().await;
+        let response = req_builder.send().await?;
+        self.rpc_throttle.observe(response.headers()).await;
+        let response: GetLedgerEntriesResponse = response
             .json()
             .await
             .map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
@@ -1444,12 +1852,10 @@ impl SimulationEngine {
             },
         };
 
-        let response2: GetLedgerEntriesResponse = self
-            .client
-            .post(&url)
-            .json(&req2)
-            .send()
-            .await?
+        self.rpc_throttle.wait().await;
+        let response2 = self.client.post(&url).json(&req2).send().await?;
+        self.rpc_throttle.observe(response2.headers()).await;
+        let response2: GetLedgerEntriesResponse = response2
             .json()
             .await
             .map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
@@ -1485,6 +1891,76 @@ impl SimulationEngine {
         }
 
         Ok(wasm_bytes)
+    }
+
+    /// Invoke a read-only, zero-argument contract function and return its
+    /// decoded return value, without computing full resource metrics.
+    ///
+    /// Used by the GraphQL token metadata query to assemble a SEP-41
+    /// token's `name`/`symbol`/`decimals` from three simulated invocations
+    /// in a single request instead of three separate `/analyze` REST
+    /// round-trips. Returns `Ok(None)` if the simulation produced no
+    /// result entry (e.g. the function returns `void`).
+    pub async fn invoke_read_only(
+        &self,
+        contract_id: &str,
+        function_name: &str,
+    ) -> Result<Option<soroban_sdk::xdr::ScVal>, SimulationError> {
+        let transaction_xdr = self.create_invoke_transaction(contract_id, function_name, vec![])?;
+
+        let (url, auth_header, auth_value) = match &self.registry {
+            Some(reg) => {
+                let p = reg
+                    .healthy_providers()
+                    .await
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        SimulationError::RpcRequestFailed("No healthy providers".to_string())
+                    })?;
+                (p.url.clone(), p.auth_header.clone(), p.auth_value.clone())
+            }
+            None => (self.rpc_url.clone(), None, None),
+        };
+
+        let request = SimulateTransactionRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+            method: "simulateTransaction".to_string(),
+            params: SimulateTransactionParams {
+                transaction: transaction_xdr,
+            },
+        };
+
+        let mut req_builder = self.client.post(&url).json(&request);
+        if let (Some(header), Some(value)) = (auth_header.as_deref(), auth_value.as_deref()) {
+            req_builder = req_builder.header(header, value);
+        }
+        self.rpc_throttle.wait().await;
+        let response = req_builder.send().await?;
+        self.rpc_throttle.observe(response.headers()).await;
+        let response: SimulateTransactionResponse = response
+            .json()
+            .await
+            .map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
+
+        let result = match response.result {
+            ResponseResult::Success { result } => result,
+            ResponseResult::Error { error } => {
+                return Err(SimulationError::NodeError(error.message))
+            }
+        };
+
+        let Some(first) = result.results.first() else {
+            return Ok(None);
+        };
+        let xdr_b64 = first.get("xdr").and_then(|v| v.as_str()).ok_or_else(|| {
+            SimulationError::InvalidContract("Missing return value XDR".to_string())
+        })?;
+        let bytes = BASE64.decode(xdr_b64)?;
+        let scval = soroban_sdk::xdr::ScVal::from_xdr(&bytes, Limits::none())
+            .map_err(|e| SimulationError::XdrError(e.to_string()))?;
+        Ok(Some(scval))
     }
 
     /// Simulate transaction from a deployed contract ID
@@ -2075,7 +2551,9 @@ impl SimulationEngine {
         // 2. Build transaction XDR
         let invoke_op = InvokeHostFunctionOp {
             host_function,
-            auth: vec![].try_into().unwrap(),
+            auth: vec![]
+                .try_into()
+                .map_err(|_| SimulationError::XdrError("Too many auth entries".to_string()))?,
         };
 
         let operation = Operation {
@@ -2091,7 +2569,9 @@ impl SimulationEngine {
             seq_num: SequenceNumber(0),
             cond: Preconditions::None,
             memo: Memo::None,
-            operations: vec![operation].try_into().unwrap(),
+            operations: vec![operation].try_into().map_err(|_| {
+                SimulationError::XdrError("Failed to create operations".to_string())
+            })?,
             ext: TransactionExt::V1(soroban_data),
         };
 
@@ -2452,6 +2932,7 @@ impl SimulationEngine {
             req_builder = req_builder.header(header, value);
         }
 
+        self.rpc_throttle.wait().await;
         let response = tokio::time::timeout(self.request_timeout, req_builder.send())
             .await
             .map_err(|_| SimulationError::NodeTimeout)?
@@ -2464,6 +2945,7 @@ impl SimulationEngine {
                     SimulationError::RpcRequestFailed(format!("Network error: {}", e))
                 }
             })?;
+        self.rpc_throttle.observe(response.headers()).await;
 
         if !response.status().is_success() {
             return Err(SimulationError::RpcRequestFailed(format!(
@@ -2711,10 +3193,12 @@ impl SimulationEngine {
             req_builder = req_builder.header(header, value);
         }
 
+        self.rpc_throttle.wait().await;
         let response = tokio::time::timeout(self.request_timeout, req_builder.send())
             .await
             .map_err(|_| SimulationError::NodeTimeout)?
             .map_err(|e| SimulationError::RpcRequestFailed(format!("Network error: {}", e)))?;
+        self.rpc_throttle.observe(response.headers()).await;
 
         if !response.status().is_success() {
             return Err(SimulationError::RpcRequestFailed(format!(
@@ -2798,10 +3282,11 @@ impl SimulationEngine {
             .collect()
     }
 
-    fn parse_simulation_result(
+    pub(crate) fn parse_simulation_result(
         &self,
         rpc_result: SimulationRpcResult,
     ) -> Result<SimulationResult, SimulationError> {
+        let mut rent_bytes: Option<u64> = None;
         let resources = if let Some(cost) = rpc_result.cost {
             let cpu_instructions = cost.cpu_insns.parse::<u64>().unwrap_or_else(|_| {
                 tracing::warn!("Failed to parse cpu_insns, using 0");
@@ -2811,6 +3296,19 @@ impl SimulationEngine {
                 tracing::warn!("Failed to parse mem_bytes, using 0");
                 0
             });
+            // Absent on pre-protocol-20 nodes, and a refund estimate is only
+            // meaningful with it, so a missing value stays `None` all the way to
+            // the fee quote rather than being defaulted to zero.
+            rent_bytes = cost
+                .rent_bytes
+                .as_ref()
+                .and_then(|raw| match raw.parse::<u64>() {
+                    Ok(value) => Some(value),
+                    Err(e) => {
+                        tracing::warn!("Failed to parse rent_bytes: {}", e);
+                        None
+                    }
+                });
             let (ledger_read_bytes, ledger_write_bytes) =
                 self.extract_footprint_from_xdr(&rpc_result.transaction_data);
             SorobanResources {
@@ -2832,6 +3330,7 @@ impl SimulationEngine {
             transaction_hash: None,
             latest_ledger: rpc_result.latest_ledger,
             cost_stroops,
+            rent_bytes,
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: rpc_result.transaction_data,
@@ -3025,6 +3524,15 @@ impl SimulationEngine {
 
     pub(crate) fn parse_sc_val_arg(&self, arg: &str) -> Result<ScVal, SimulationError> {
         let arg = arg.trim();
+
+        // 0. Explicit wide-integer form. Checked before JSON because a bare
+        //    integer would otherwise land on i64, and contracts that take an
+        //    i128 (SAC `transfer` amounts, for one) reject the call with a type
+        //    error that gives no hint about the real problem.
+        if let Some(rest) = arg.strip_prefix(crate::sac_transfer::I128_ARG_PREFIX) {
+            return ArgParser::parse_i128(rest)
+                .map_err(|e| SimulationError::NodeError(e.to_string()));
+        }
 
         // 1. Try parsing as JSON first (for complex types like Maps and Vecs)
         if arg.starts_with('{') || arg.starts_with('[') {
@@ -3278,7 +3786,9 @@ impl SimulationEngine {
             .map_err(|e| SimulationError::XdrError(format!("Encode invocation: {e}")))?;
         let nonce_input = [&public_key[..], &invocation_xdr[..]].concat();
         let nonce_hash = Sha256::digest(&nonce_input);
-        let nonce = i64::from_be_bytes(nonce_hash[..8].try_into().unwrap());
+        let nonce = i64::from_be_bytes(nonce_hash[..8].try_into().map_err(|_| {
+            SimulationError::XdrError("Failed to derive nonce from hash".to_string())
+        })?);
 
         // 3. Compute the network id
         let network_id: [u8; 32] = Sha256::digest(network_passphrase.as_bytes()).into();
@@ -3354,17 +3864,13 @@ pub fn profile_contract(
 
     let env = Env::default();
 
-    if let Some(version) = protocol_version {
-        tracing::info!("Setting simulated protocol version to {}", version);
-        env.ledger().set_protocol_version(version);
-    }
+    let version = protocol_version.unwrap_or(22);
+    tracing::info!("Setting simulated protocol version to {}", version);
+    env.ledger().set_protocol_version(version);
 
     if enable_experimental.unwrap_or(false) {
         tracing::info!("Experimental host functions enabled (via custom host config)");
-        // Note: Full support for experimental functions often requires a custom Host build.
-        // For this sandbox, we ensure the protocol version is set to at least 21
-        // if experimental is requested but no version is provided.
-        if protocol_version.is_none() {
+        if protocol_version.is_none() || version < 21 {
             env.ledger().set_protocol_version(21);
         }
     }
@@ -3637,6 +4143,7 @@ pub fn profile_contract_with_flamegraph(
     function_name: String,
     args: Vec<String>,
 ) -> Result<(SorobanResources, ProfileResult), SimulationError> {
+    use soroban_sdk::testutils::Ledger;
     use soroban_sdk::{Env, Symbol, Val};
     use std::time::Instant;
 
@@ -3702,6 +4209,7 @@ pub fn profile_contract_with_flamegraph(
 
     // ── Execute in soroban-sdk Env ────────────────────────────────────────────
     let env = Env::default();
+    env.ledger().set_protocol_version(22);
     env.mock_all_auths();
 
     // Wrap registration in catch_unwind — the soroban host panics on invalid WASM
@@ -3856,6 +4364,46 @@ pub fn profile_contract_with_flamegraph(
 mod tests {
     use super::*;
     use crate::cache::SimulationCache;
+    use crate::failure::{ExecutionFailure, FailureKind};
+
+    // ── Issue #1006: classified failures keep their retry semantics ──────────
+
+    /// The classification is for debugging, not for retry routing. A budget
+    /// overrun is exactly as terminal as a panic, so this pins the invariant
+    /// that `is_retriable()` did not change.
+    #[test]
+    fn classified_execution_failures_are_never_retriable() {
+        for kind in [
+            FailureKind::CpuLimit,
+            FailureKind::MemLimit,
+            FailureKind::Storage,
+            FailureKind::Auth,
+            FailureKind::ContractTrap,
+            FailureKind::Other,
+        ] {
+            let err = SimulationError::ExecutionFailed(ExecutionFailure::from_diagnostic(
+                "HostError: Error(Limits, exceeded)",
+            ));
+            assert_eq!(err.is_retriable(), false, "kind {:?}", kind);
+        }
+    }
+
+    #[test]
+    fn local_unavailable_remains_the_only_retriable_error() {
+        assert!(SimulationError::LocalUnavailable.is_retriable());
+    }
+
+    #[test]
+    fn execution_failed_display_names_the_kind_and_resolved_error() {
+        let failure = ExecutionFailure::from_diagnostic("HostError: Error(Contract, #3)")
+            .at(Some("CBQHNAX3CFZWBUF2J4C6QEBGB2FEHZPXN2O3KILYZQ2X5XNBEHXHDW5TK".into()), Some("transfer".into()));
+        let err = SimulationError::ExecutionFailed(failure);
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("contract_trap"), "got {}", rendered);
+        assert!(rendered.contains("contracterror #3 (Unauthorized)"), "got {}", rendered);
+        assert!(rendered.contains("transfer"), "got {}", rendered);
+    }
 
     fn auth_invocation() -> SorobanAuthorizedInvocation {
         SorobanAuthorizedInvocation {
@@ -4145,6 +4693,7 @@ mod tests {
             transaction_hash: None,
             latest_ledger: 1000,
             cost_stroops: 1,
+            rent_bytes: None,
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: "AAA=".to_string(),
@@ -4178,6 +4727,7 @@ mod tests {
             transaction_hash: None,
             latest_ledger: 1000,
             cost_stroops: 1,
+            rent_bytes: None,
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: "AAA=".to_string(),
@@ -4414,6 +4964,38 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_soroban_budget_limits_v21_format() {
+        let log = "INFO soroban_cli: budget: cpu: 100000, mem: 2048";
+        assert_eq!(extract_soroban_budget_limits(log), Some((100000, 2048)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_legacy_format() {
+        let log = "budget: instructions: 500000, memory: 4096";
+        assert_eq!(extract_soroban_budget_limits(log), Some((500000, 4096)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_rpc_cost_format() {
+        let log = "cost: cpu_insns: 123, mem_bytes: 456";
+        assert_eq!(extract_soroban_budget_limits(log), Some((123, 456)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_reversed_legacy_order() {
+        let log = "budget: memory: 100, instructions: 200";
+        assert_eq!(extract_soroban_budget_limits(log), Some((200, 100)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_missing_values_returns_none() {
+        assert_eq!(
+            extract_soroban_budget_limits("budget: cpu: 123"),
+            None
+        );
+    }
+
+    #[test]
     fn test_estimate_scval_size_primitives() {
         use soroban_sdk::xdr::ScVal;
         let engine = SimulationEngine::new("https://test.com".to_string());
@@ -4530,6 +5112,7 @@ mod tests {
                 transaction_hash: None,
                 latest_ledger: 42,
                 cost_stroops: 10,
+                rent_bytes: None,
                 state_dependency: None,
                 ttl_analysis: None,
                 transaction_data: "AAA=".to_string(),
@@ -5156,8 +5739,82 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_analyze_instance_storage_candidates_insufficient_steps() {
+        let report = analyze_instance_storage_candidates(&[], 1);
+        assert_eq!(report.status, "insufficient_steps");
+        assert!(report.candidates.is_empty());
+
+        let step0 = vec![ScenarioKeyAccess {
+            step_index: 0,
+            key: "ADMIN_CONFIG".to_string(),
+            key_type: "persistent".to_string(),
+            access_type: "write".to_string(),
+            key_bytes: 64,
+        }];
+        let single_step_report = analyze_instance_storage_candidates(&[step0], 1);
+        assert_eq!(single_step_report.status, "insufficient_steps");
+        assert!(single_step_report.candidates.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_instance_storage_candidates_flags_admin_config_not_counter() {
+        let step0 = vec![
+            ScenarioKeyAccess {
+                step_index: 0,
+                key: "ADMIN_CONFIG".to_string(),
+                key_type: "persistent".to_string(),
+                access_type: "write".to_string(),
+                key_bytes: 64,
+            },
+            ScenarioKeyAccess {
+                step_index: 0,
+                key: "COUNTER".to_string(),
+                key_type: "persistent".to_string(),
+                access_type: "write".to_string(),
+                key_bytes: 32,
+            },
+        ];
+
+        let step1 = vec![
+            ScenarioKeyAccess {
+                step_index: 1,
+                key: "ADMIN_CONFIG".to_string(),
+                key_type: "persistent".to_string(),
+                access_type: "read".to_string(),
+                key_bytes: 64,
+            },
+            ScenarioKeyAccess {
+                step_index: 1,
+                key: "COUNTER".to_string(),
+                key_type: "persistent".to_string(),
+                access_type: "write".to_string(),
+                key_bytes: 32,
+            },
+        ];
+
+        let step2 = vec![
+            ScenarioKeyAccess {
+                step_index: 2,
+                key: "ADMIN_CONFIG".to_string(),
+                key_type: "persistent".to_string(),
+                access_type: "read".to_string(),
+                key_bytes: 64,
+            },
+        ];
+
+        let report = analyze_instance_storage_candidates(&[step0, step1, step2], 1);
+        assert_eq!(report.status, "available");
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].key, "ADMIN_CONFIG");
+        assert_eq!(report.candidates[0].total_reads_after_init, 2);
+        assert_eq!(report.candidates[0].estimated_read_bytes_saved, 128);
+        assert!(report.candidates[0].estimated_rent_savings_stroops > 0);
+    }
     #[test]
     fn test_debug_soroban_wasm_counter() {
+        use soroban_sdk::testutils::Ledger;
         use soroban_sdk::{Env, Symbol, Val};
         let wasm = soroban_wasm();
         let instr = WasmInstrumenter::new(&wasm).expect("parse ok");
@@ -5170,6 +5827,7 @@ mod tests {
         );
 
         let env = Env::default();
+        env.ledger().set_protocol_version(22);
         env.mock_all_auths();
         let contract_id = env.register(&*instrumented, ());
 
@@ -5193,4 +5851,235 @@ mod tests {
         let count = result.unwrap().get_payload() >> 8;
         assert!(count > 0, "counter should be > 0, got {count}");
     }
+
+    #[test]
+    fn test_extract_soroban_budget_from_logs_v21_and_legacy() {
+        // v21+ format
+        let v21_logs = "INFO soroban_cli::run: Budget: cpu: 1234567, mem: 987654";
+        let parsed_v21 = extract_soroban_budget_from_logs(v21_logs);
+        assert_eq!(parsed_v21.cpu_instructions, 1234567);
+        assert_eq!(parsed_v21.memory_bytes, 987654);
+
+        // Legacy format
+        let legacy_logs = "Budget report:\nCpuCost: 500000\nMemCost: 250000";
+        let parsed_legacy = extract_soroban_budget_from_logs(legacy_logs);
+        assert_eq!(parsed_legacy.cpu_instructions, 500000);
+        assert_eq!(parsed_legacy.memory_bytes, 250000);
+    #[test]
+    fn test_profile_concentrated_amm_ticks_monotonic_and_warning() {
+        // Swaps crossing 1, 2, 4, 8 ticks with increasing CPU and reads
+        let raw = vec![
+            (1, 10_000_000, 5, 2),
+            (2, 20_000_000, 10, 4),
+            (4, 40_000_000, 20, 8),
+            (8, 75_000_000, 36, 12),
+        ];
+
+        let limits = NetworkLimits {
+            max_cpu_instructions: 100_000_000,
+            max_read_entries: 40,
+            max_write_entries: 20,
+        };
+
+        let report = profile_concentrated_amm_ticks(&raw, Some(limits)).unwrap();
+        assert_eq!(report.status, "success");
+        assert_eq!(report.measurements.len(), 4);
+        assert_eq!(report.max_supported_ticks, 8);
+
+        // 36 reads is 90% of 40, so read_entries is limiting_dimension
+        assert_eq!(
+            report.measurements[3].headroom.limiting_dimension,
+            Some("read_entries".to_string())
+        );
+
+        // Next doubling to 16 ticks estimated 72 reads > 40 max -> warning insight present
+        assert!(report.warning_insight.is_some());
+        let warning = report.warning_insight.unwrap();
+        assert!(warning.contains("Next doubling to 16 ticks would exceed read-entry limit (40)"));
+    }
+
+    #[test]
+    fn test_profile_concentrated_amm_ticks_fails_on_non_monotonic_reads() {
+        let non_monotonic = vec![
+            (1, 10_000_000, 10, 2),
+            (2, 20_000_000, 8, 4), // Non-monotonic read drop
+        ];
+
+        let result = profile_concentrated_amm_ticks(&non_monotonic, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Non-monotonic read entries detected"));
+    }
+
+    #[tokio::test]
+    async fn test_batched_ledger_hydrator_zero_keys() {
+        let hydrator = BatchedLedgerHydrator::new(100);
+        let calls_made = std::sync::atomic::AtomicUsize::new(0);
+
+        let report = hydrator
+            .hydrate(
+                &[],
+                100,
+                |_key, _seq| None,
+                |_batch| async {
+                    calls_made.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(HashMap::new())
+                },
+            )
+            .await;
+
+        assert_eq!(report.total_keys_requested, 0);
+        assert_eq!(report.rpc_calls_made, 0);
+        assert_eq!(report.cache_hits, 0);
+        assert!(report.fetched_entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_batched_ledger_hydrator_250_keys_3_batches() {
+        let hydrator = BatchedLedgerHydrator::new(100);
+        let keys: Vec<String> = (0..250).map(|i| format!("key_{i}")).collect();
+
+        let report = hydrator
+            .hydrate(
+                &keys,
+                100,
+                |_key, _seq| None,
+                |batch| async move {
+                    let mut map = HashMap::new();
+                    for k in batch {
+                        map.insert(k.clone(), format!("xdr_{k}"));
+                    }
+                    Ok(map)
+                },
+            )
+            .await;
+
+        assert_eq!(report.total_keys_requested, 250);
+        assert_eq!(report.rpc_calls_made, 3);
+        assert_eq!(report.cache_hits, 0);
+        assert_eq!(report.fetched_entries.len(), 250);
+        assert!(report.missing_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_batched_ledger_hydrator_warm_cache_zero_calls() {
+        let hydrator = BatchedLedgerHydrator::new(100);
+        let keys: Vec<String> = (0..50).map(|i| format!("key_{i}")).collect();
+
+        let report = hydrator
+            .hydrate(
+                &keys,
+                100,
+                |key, _seq| Some(format!("cached_xdr_{key}")),
+                |_batch| async {
+                    panic!("RPC call should not be made for warm cache");
+                },
+            )
+            .await;
+
+        assert_eq!(report.total_keys_requested, 50);
+        assert_eq!(report.cache_hits, 50);
+        assert_eq!(report.rpc_calls_made, 0);
+        assert_eq!(report.fetched_entries.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_batched_ledger_hydrator_partial_error() {
+        let hydrator = BatchedLedgerHydrator::new(10);
+        let keys: Vec<String> = (0..15).map(|i| format!("key_{i}")).collect();
+
+        let report = hydrator
+            .hydrate(
+                &keys,
+                100,
+                |_key, _seq| None,
+                |batch| async move {
+                    if batch.contains(&"key_0".to_string()) {
+                        let mut map = HashMap::new();
+                        for k in batch {
+                            map.insert(k, "xdr_val".to_string());
+                        }
+                        Ok(map)
+                    } else {
+                        Err("RPC partial error".to_string())
+                    }
+                },
+            )
+            .await;
+
+        assert_eq!(report.total_keys_requested, 15);
+        assert_eq!(report.rpc_calls_made, 2);
+        assert_eq!(report.fetched_entries.len(), 10);
+        assert_eq!(report.missing_keys.len(), 5);
+    }
 }
+
+/// Parsed host budget consumption (CPU instructions, memory bytes) extracted from Soroban CLI log output.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExtractedSorobanBudget {
+    pub cpu_instructions: u64,
+    pub memory_bytes: u64,
+}
+
+/// Extract Soroban host budget limits from log output strings.
+/// Supports Soroban CLI v21+ format changes with fallbacks for legacy log output formats.
+pub fn extract_soroban_budget_from_logs(logs: &str) -> ExtractedSorobanBudget {
+    let mut result = ExtractedSorobanBudget::default();
+
+    for line in logs.lines() {
+        let line_lower = line.to_lowercase();
+
+        if line_lower.contains("cpu") || line_lower.contains("mem") || line_lower.contains("budget") {
+            if let Some(idx) = line_lower.find("cpu:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 4..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpu_instructions:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 17..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpu cost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 9..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpucost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 8..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpuinvocations:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 15..]) {
+                    result.cpu_instructions = val;
+                }
+            }
+
+            if let Some(idx) = line_lower.find("mem:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 4..]) {
+                    result.memory_bytes = val;
+                }
+            } else if let Some(idx) = line_lower.find("memory_bytes:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 13..]) {
+                    result.memory_bytes = val;
+                }
+            } else if let Some(idx) = line_lower.find("mem cost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 9..]) {
+                    result.memory_bytes = val;
+                }
+            } else if let Some(idx) = line_lower.find("memcost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 8..]) {
+                    result.memory_bytes = val;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn parse_trailing_number(s: &str) -> Option<u64> {
+    let digits: String = s
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+

@@ -5,7 +5,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, BytesN as _, Ledger},
-    Address, BytesN, Env, String,
+    Address, BytesN, Env, String, Vec,
 };
 
 fn setup(identity_required: bool) -> (Env, Address, Address, Address, Address) {
@@ -24,6 +24,61 @@ fn setup(identity_required: bool) -> (Env, Address, Address, Address, Address) {
 
 fn make_identity(env: &Env, seed: u8) -> BytesN<32> {
     BytesN::from_array(env, &[seed; 32])
+}
+
+fn setup_multisig() -> (Env, Address, Address, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(GovernanceContract, ());
+    let admin_a = Address::generate(&env);
+    let admin_b = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    let mut admins = Vec::new(&env);
+    admins.push_back(admin_a.clone());
+    admins.push_back(admin_b.clone());
+    GovernanceContractClient::new(&env, &contract_id)
+        .initialize_with_admins(&admin_a, &admins, &2, &9, &false);
+    (env, contract_id, admin_a, admin_b, outsider)
+}
+
+fn expired_proposal(client: &GovernanceContractClient<'_>, env: &Env) -> Proposal {
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    let proposal = client.create_proposal(
+        &String::from_str(env, "Execute approved decision"),
+        &String::from_str(env, "Requires M-of-N authorization"),
+        &11,
+    );
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
+    proposal
+}
+
+#[test]
+fn execution_requires_distinct_threshold_admin_approvals() {
+    let (env, contract_id, admin_a, admin_b, _) = setup_multisig();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    let proposal = expired_proposal(&client, &env);
+    let mut one_approval = Vec::new(&env);
+    one_approval.push_back(admin_a.clone());
+    assert_eq!(client.try_execute_proposal(&proposal.id, &one_approval), Err(Ok(Error::InsufficientApprovals)));
+    let mut approvals = Vec::new(&env);
+    approvals.push_back(admin_a);
+    approvals.push_back(admin_b);
+    assert!(!client.execute_proposal(&proposal.id, &approvals).open);
+}
+
+#[test]
+fn duplicate_or_non_admin_execution_approvals_are_rejected() {
+    let (env, contract_id, admin_a, _, outsider) = setup_multisig();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    let proposal = expired_proposal(&client, &env);
+    let mut duplicate_approvals = Vec::new(&env);
+    duplicate_approvals.push_back(admin_a.clone());
+    duplicate_approvals.push_back(admin_a);
+    assert_eq!(client.try_execute_proposal(&proposal.id, &duplicate_approvals), Err(Ok(Error::InsufficientApprovals)));
+    let mut invalid_approvals = Vec::new(&env);
+    invalid_approvals.push_back(outsider.clone());
+    invalid_approvals.push_back(outsider);
+    assert_eq!(client.try_execute_proposal(&proposal.id, &invalid_approvals), Err(Ok(Error::Unauthorized)));
 }
 
 #[test]

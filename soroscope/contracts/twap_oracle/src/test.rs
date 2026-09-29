@@ -112,3 +112,68 @@ fn test_not_initialized() {
     assert_eq!(client.update_price(&100), Err(Error::NotInitialized));
     assert_eq!(client.get_twap(), 0);
 }
+
+#[test]
+fn test_large_price_accumulation_no_overflow() {
+    let e = Env::default();
+    e.ledger().with_mut(|li| li.timestamp = 0);
+
+    let contract_id = e.register(TwapOracle, ());
+    let client = TwapOracleClient::new(&e, &contract_id);
+
+    let token_a = Address::generate(&e);
+    let token_b = Address::generate(&e);
+
+    client.initialize(&token_a, &token_b, &1);
+
+    // Simulate a year of operation with high-precision prices (~18 decimals).
+    // Price = 1_000_000_000_000_000_000 (1 token with 18 decimals)
+    // Time = 31_536_000 seconds (~1 year)
+    // Cumulative = price * time ≈ 3.15 * 10^25, well within u128 range.
+    let high_price: i128 = 1_000_000_000_000_000_000; // 1e18
+    let year_seconds: u64 = 31_536_000;
+
+    // First update at t=0 sets last_price, but no elapsed time yet.
+    assert_eq!(client.update_price(&high_price), Ok(()));
+
+    // Advance one year
+    e.ledger().with_mut(|li| li.timestamp = year_seconds);
+
+    // Update again: cumulative = 0 + high_price * year_seconds
+    assert_eq!(client.update_price(&high_price), Ok(()));
+
+    let twap = client.get_twap();
+    // TWAP should equal the price since it was constant all year.
+    assert_eq!(twap, high_price);
+}
+
+#[test]
+fn test_u128_wrapping_does_not_panic() {
+    let e = Env::default();
+    e.ledger().with_mut(|li| li.timestamp = 0);
+
+    let contract_id = e.register(TwapOracle, ());
+    let client = TwapOracleClient::new(&e, &contract_id);
+
+    let token_a = Address::generate(&e);
+    let token_b = Address::generate(&e);
+
+    client.initialize(&token_a, &token_b, &1);
+
+    // Use extremely large values that would overflow i128 but are handled safely by u128 wrapping.
+    let max_price: i128 = i128::MAX;
+
+    assert_eq!(client.update_price(&max_price), Ok(()));
+
+    // Advance by a large amount
+    e.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    // This multiplication would overflow i128, but u128 wrapping handles it gracefully.
+    let result = client.update_price(&max_price);
+    // The update should succeed without panicking.
+    assert_eq!(result, Ok(()));
+
+    // get_twap should not panic either.
+    let _twap = client.get_twap();
+}
+

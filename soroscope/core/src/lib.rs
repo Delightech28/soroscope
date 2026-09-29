@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod comparison;
+pub mod event_dedup;
 pub mod errors;
 pub mod gas_golfing;
 pub mod insights;

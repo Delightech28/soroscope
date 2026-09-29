@@ -1,6 +1,8 @@
 #![no_std]
 #![allow(deprecated)]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, Env, Error, IntoVal, Val, Vec,
+};
 
 /// A meta-transaction (gasless) request signed by the user.
 #[contracttype]
@@ -97,17 +99,40 @@ impl Gasless {
             .persistent()
             .set(&DataKey::Nonce(meta_tx.from.clone()), &next_nonce);
 
-        // Execute the transfer.
-        token::Client::new(&env, &meta_tx.token).transfer(
-            &meta_tx.from,
-            &meta_tx.to,
-            &meta_tx.amount,
+        // Execute the transfer via try_invoke_contract so that the nonce
+        // increment above survives even if the token transfer reverts.
+        // This prevents replay attacks: the nonce is consumed regardless
+        // of whether the inner call succeeds or fails.
+        let args: Vec<Val> = Vec::from_array(
+            &env,
+            [
+                meta_tx.from.into_val(&env),
+                meta_tx.to.into_val(&env),
+                meta_tx.amount.into_val(&env),
+            ],
         );
 
-        env.events().publish(
-            (symbol_short!("executed"),),
-            (meta_tx.from, meta_tx.to, meta_tx.amount, meta_tx.nonce),
-        );
+        match env.try_invoke_contract::<Val, Error>(
+            &meta_tx.token,
+            &symbol_short!("transfer"),
+            args,
+        ) {
+            Ok(Ok(_)) => {
+                // Transfer succeeded.
+                env.events().publish(
+                    (symbol_short!("executed"),),
+                    (meta_tx.from, meta_tx.to, meta_tx.amount, meta_tx.nonce),
+                );
+            }
+            _ => {
+                // Transfer failed — nonce is already consumed.
+                // Emit a failure event so the relayer can distinguish.
+                env.events().publish(
+                    (symbol_short!("failed"),),
+                    (meta_tx.from, meta_tx.to, meta_tx.amount, meta_tx.nonce),
+                );
+            }
+        }
     }
 
     /// Return the current nonce for `user` (the next expected nonce).

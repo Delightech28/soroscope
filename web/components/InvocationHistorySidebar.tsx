@@ -41,13 +41,13 @@ export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySi
           width: '28px',
           height: '28px',
           borderRadius: '50%',
-          backgroundColor: '#161b22',
+          backgroundColor: 'var(--bg-card)',
           border: '1px solid #30363d',
           cursor: 'pointer',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          color: '#8b949e',
+          color: 'var(--text-secondary)',
           flexShrink: 0,
         }}
       >
@@ -58,7 +58,7 @@ export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySi
         <div
           style={{
             width: '248px',
-            backgroundColor: '#161b22',
+            backgroundColor: 'var(--bg-card)',
             border: '1px solid #30363d',
             borderRadius: '8px',
             display: 'flex',
@@ -80,7 +80,7 @@ export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySi
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: '7px' }}>
               <Clock size={13} color="#8b949e" />
-              <span style={{ fontSize: '13px', fontWeight: '600', color: '#c9d1d9' }}>
+              <span style={{ fontSize: '13px', fontWeight: '600', color: 'var(--text-primary)' }}>
                 History
               </span>
               {history.length > 0 && (
@@ -88,7 +88,7 @@ export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySi
                   style={{
                     fontSize: '11px',
                     backgroundColor: '#21262d',
-                    color: '#8b949e',
+                    color: 'var(--text-secondary)',
                     borderRadius: '10px',
                     padding: '1px 6px',
                     lineHeight: '16px',
@@ -107,7 +107,7 @@ export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySi
                   background: 'none',
                   border: 'none',
                   cursor: 'pointer',
-                  color: '#8b949e',
+                  color: 'var(--text-secondary)',
                   padding: '2px',
                   display: 'flex',
                   alignItems: 'center',
@@ -128,7 +128,7 @@ export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySi
                 style={{
                   padding: '40px 16px',
                   textAlign: 'center',
-                  color: '#8b949e',
+                  color: 'var(--text-secondary)',
                   fontSize: '12px',
                 }}
               >
@@ -172,7 +172,7 @@ export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySi
                             margin: '0 0 2px 0',
                             fontSize: '12px',
                             fontWeight: '500',
-                            color: '#c9d1d9',
+                            color: 'var(--text-primary)',
                             overflow: 'hidden',
                             textOverflow: 'ellipsis',
                             whiteSpace: 'nowrap',
@@ -181,7 +181,7 @@ export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySi
                           {item.functionName}
                         </p>
 
-                        <p style={{ margin: '0', fontSize: '11px', color: '#8b949e' }}>
+                        <p style={{ margin: '0', fontSize: '11px', color: 'var(--text-secondary)' }}>
                           {formatDate(item.timestamp)} · {formatTime(item.timestamp)}
                         </p>
 
