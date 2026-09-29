@@ -24,8 +24,6 @@ url = { version = "2", features = ["serde"] }
 sha2 = "0.10"
 hmac = "0.12"
 thiserror = "1.0"
-async-trait = "0.1"
-regex = "1.10"
 dotenvy = "0.15"
 config = "0.14"
 axum = { version = "0.7", features = ["multipart", "ws"] }
