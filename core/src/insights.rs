@@ -509,6 +509,33 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_tree_over_limit_emits_auth_bytes_warning() {
+        let engine = InsightsEngine::new();
+        let auth_tree = AuthTreeReport {
+            entry_count: 2,
+            max_depth: 2,
+            credential_kinds: vec![
+                crate::simulation::AuthCredentialKind::Ed25519,
+                crate::simulation::AuthCredentialKind::Contract,
+            ],
+            total_xdr_bytes: 100_001,
+            transaction_size_limit_bytes: 100_000,
+            exceeds_transaction_size_limit: true,
+            auth_cpu_instructions: None,
+        };
+
+        let report = engine.analyze_with_auth_tree(&minimal_resources(), &auth_tree);
+        let insight = report
+            .insights
+            .iter()
+            .find(|insight| insight.rule == "auth_tree_size")
+            .expect("oversized auth tree should produce a warning");
+        assert_eq!(insight.severity, Severity::Warning);
+        assert!(insight.message.contains("Authorization bytes (100001)"));
+        assert!(insight.message.contains("100000 bytes"));
+    }
+
+    #[test]
     fn test_score_never_below_zero() {
         let engine = InsightsEngine::new();
         let r = SorobanResources {

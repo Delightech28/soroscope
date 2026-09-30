@@ -91,6 +91,7 @@ mod tests {
                     res.ledger_write_bytes,
                 ),
                 resources: res,
+                auth_tree: Default::default(),
                 transaction_hash: None,
                 latest_ledger: ledger,
                 cost_stroops: cost,

@@ -15,9 +15,11 @@ interface WalletContextType {
   connect: (moduleId: string) => Promise<void>;
   disconnect: () => Promise<void>;
   address: string | null;
+  networkName: string;
   isConnected: boolean;
   isConnecting: boolean;
   selectedWalletId: string | null;
+  selectedWalletName: string | null;
   openModal: () => void;
   closeModal: () => void;
   isModalOpen: boolean;
@@ -30,6 +32,13 @@ interface WalletContextType {
 }
 
 const WalletContext = createContext<WalletContextType | undefined>(undefined);
+
+const SUPPORTED_WALLETS = [
+  { id: "freighter", name: "Freighter", icon: "https://stellar.creit.tech/wallet-icons/freighter.png" },
+  { id: "albedo", name: "Albedo", icon: "https://stellar.creit.tech/wallet-icons/albedo.png" },
+  { id: "lobstr", name: "Lobstr", icon: "https://stellar.creit.tech/wallet-icons/lobstr.png" },
+  { id: "xbull", name: "xBull", icon: "https://stellar.creit.tech/wallet-icons/xbull.png" },
+];
 
 export const useWallet = () => {
   const context = useContext(WalletContext);
@@ -149,14 +158,6 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
     localStorage.removeItem("inheritx_wallet_address");
     localStorage.removeItem("inheritx_wallet_id");
   }, [clearWalletState]);
-
-  const supportedWallets = [
-    { id: "freighter", name: "Freighter", icon: "https://stellar.creit.tech/wallet-icons/freighter.png" },
-    { id: "albedo", name: "Albedo", icon: "https://stellar.creit.tech/wallet-icons/albedo.png" },
-    { id: "xbull", name: "xBull", icon: "https://stellar.creit.tech/wallet-icons/xbull.png" },
-    { id: "rabet", name: "Rabet", icon: "https://stellar.creit.tech/wallet-icons/rabet.png" },
-    { id: "lobstr", name: "Lobstr", icon: "https://stellar.creit.tech/wallet-icons/lobstr.png" },
-  ];
 
   const connectWallet = async (moduleId: string) => {
     if (!kit) {

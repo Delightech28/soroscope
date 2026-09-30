@@ -34,6 +34,7 @@ mod rpc_throttle;
 mod runner;
 pub mod sac_transfer;
 mod simulation;
+mod xdr_decoder;
 mod simulation_service;
 pub mod sys_alarms;
 mod task_queue;
@@ -672,6 +673,7 @@ pub struct ResourceReport {
     /// Estimated cost in stroops
     #[schema(example = 1000)]
     pub cost_stroops: u64,
+    pub auth_tree: crate::simulation::AuthTreeReport,
     /// Report showing which data was injected vs live
     pub state_dependency: Option<Vec<StateDependencyReport>>,
     /// TTL status for touched ledger entries and extension suggestions.
@@ -899,6 +901,26 @@ pub struct ProfileResponse {
     pub resources: simulation::SorobanResources,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ProfileDeployWasmRequest {
+    /// Base64-encoded WASM binary to upload and instantiate.
+    pub wasm_bytes: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ProfileUpgradeWasmRequest {
+    /// Base64-encoded currently deployed WASM binary.
+    pub previous_wasm_bytes: String,
+    /// Base64-encoded replacement WASM binary.
+    pub new_wasm_bytes: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReprofileTransactionRequest {
+    /// Transaction hash (64-character hexadecimal).
+    pub transaction_hash: String,
+}
+
 /// Request body for the WASM execution-branch analysis endpoint (Issue #101).
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AnalyzeWasmBranchesRequest {
@@ -977,6 +999,7 @@ fn to_report(
         transaction_size_bytes: result.resources.transaction_size_bytes,
         bytes_by_durability,
         cost_stroops: result.cost_stroops,
+        auth_tree: result.auth_tree.clone(),
         state_dependency: result.state_dependency.as_ref().map(|deps| {
             deps.iter()
                 .map(|d| StateDependencyReport {
@@ -1172,7 +1195,9 @@ async fn analyze(
     );
 
     state.cache.log_stats();
-    let insights_report = state.insights_engine.analyze(&result.resources);
+    let insights_report = state
+        .insights_engine
+        .analyze_with_auth_tree(&result.resources, &result.auth_tree);
     state
         .metrics
         .resource_utilization_percent
@@ -1336,6 +1361,7 @@ async fn analyze_wasm(
             resources.ledger_write_bytes,
         ),
         resources,
+        auth_tree: Default::default(),
         transaction_hash: None,
         latest_ledger: 0,
         cost_stroops: 0,
@@ -1428,6 +1454,96 @@ async fn analyze_wasm_profile(
     let (resources, profile) = result;
 
     Ok(Json(ProfileResponse { profile, resources }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/analyze/transaction/replay",
+    request_body = ReprofileTransactionRequest,
+    responses(
+        (status = 200, description = "Historical transaction replay", body = simulation::HistoricalReplayReport),
+        (status = 400, description = "Transaction is not Soroban-enabled or XDR is invalid"),
+        (status = 404, description = "Historical transaction not found")
+    ),
+    security(("jwt" = [])),
+    tag = "Analysis"
+)]
+async fn reprofile_historical_transaction(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ReprofileTransactionRequest>,
+) -> Result<Json<simulation::HistoricalReplayReport>, AppError> {
+    let report = state
+        .engine
+        .reprofile_historical_transaction(&payload.transaction_hash)
+        .await?;
+    Ok(Json(report))
+}
+
+#[utoipa::path(
+    post,
+    path = "/analyze/wasm/deploy",
+    request_body = ProfileDeployWasmRequest,
+    responses(
+        (status = 200, description = "Deploy resource profile", body = simulation::DeployProfile),
+        (status = 400, description = "Invalid base64 or WASM data")
+    ),
+    tag = "Analysis"
+)]
+async fn analyze_wasm_deploy(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ProfileDeployWasmRequest>,
+) -> Result<Json<simulation::DeployProfile>, AppError> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+    let wasm_bytes = BASE64
+        .decode(&payload.wasm_bytes)
+        .map_err(|error| AppError::BadRequest(format!("Invalid base64 WASM data: {error}")))?;
+    let result = tokio::time::timeout(
+        state.simulation_timeout,
+        tokio::task::spawn_blocking(move || simulation::profile_contract_deploy(wasm_bytes)),
+    )
+    .await
+    .map_err(|_| AppError::Internal("Deploy profiling request timed out".to_string()))?
+    .map_err(|error| AppError::Internal(format!("Deploy profiling task panicked: {error}")))?
+    .map_err(|error| AppError::BadRequest(format!("Deploy profiling failed: {error}")))?;
+
+    Ok(Json(result))
+}
+
+#[utoipa::path(
+    post,
+    path = "/analyze/wasm/upgrade",
+    request_body = ProfileUpgradeWasmRequest,
+    responses(
+        (status = 200, description = "Upgrade resource profile", body = simulation::UpgradeProfile),
+        (status = 400, description = "Invalid base64 or WASM data")
+    ),
+    tag = "Analysis"
+)]
+async fn analyze_wasm_upgrade(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ProfileUpgradeWasmRequest>,
+) -> Result<Json<simulation::UpgradeProfile>, AppError> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+    let previous_wasm = BASE64
+        .decode(&payload.previous_wasm_bytes)
+        .map_err(|error| AppError::BadRequest(format!("Invalid previous WASM data: {error}")))?;
+    let new_wasm = BASE64
+        .decode(&payload.new_wasm_bytes)
+        .map_err(|error| AppError::BadRequest(format!("Invalid replacement WASM data: {error}")))?;
+    let result = tokio::time::timeout(
+        state.simulation_timeout,
+        tokio::task::spawn_blocking(move || {
+            simulation::profile_contract_upgrade(previous_wasm, new_wasm)
+        }),
+    )
+    .await
+    .map_err(|_| AppError::Internal("Upgrade profiling request timed out".to_string()))?
+    .map_err(|error| AppError::Internal(format!("Upgrade profiling task panicked: {error}")))?
+    .map_err(|error| AppError::BadRequest(format!("Upgrade profiling failed: {error}")))?;
+
+    Ok(Json(result))
 }
 
 // ── WASM branch analysis handler (Issue #101) ─────────────────────────────────
@@ -1956,13 +2072,15 @@ async fn fee_analytics(
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        analyze, analyze_wasm, optimize_limits, compare_handler,
-        analyze_host_import_heat,
+        analyze, analyze_wasm, analyze_wasm_deploy, analyze_wasm_upgrade,
+        reprofile_historical_transaction,
+        optimize_limits, compare_handler,
         auth::challenge_handler, auth::verify_handler, auth::jwks_handler,
         fee_recommend, fee_history, fee_analytics, batch_contract_state
     ),
     components(schemas(
         AnalyzeRequest, AnalyzeWasmRequest, AnalyzeWasmBranchesRequest,
+        ProfileDeployWasmRequest, ProfileUpgradeWasmRequest, ReprofileTransactionRequest,
         WasmBranchAnalysisResponse, ResourceReport,
         OptimizeLimitsRequest, OptimizeLimitsResponse,
         CompareApiResponse, RegressionReport, ResourceDelta, RegressionFlag,
@@ -1975,12 +2093,13 @@ async fn fee_analytics(
         auth::JwkSetResponse, auth::JwkResponse,
         crate::simulation::OptimizationBuffer,
         crate::simulation::SorobanResources,
-        HostImportHeatRequest, HostImportHeatResponse,
-        crate::host_import_heat::HostImportHeatMap,
-        crate::host_import_heat::HostImportHeatRow,
-        crate::host_import_heat::ImportHeat,
-        crate::host_import_heat::CostClass,
-        crate::host_import_heat::EstimateKind,
+        crate::simulation::AuthTreeReport,
+        crate::simulation::AuthCredentialKind,
+        crate::simulation::HistoricalReplayReport,
+        crate::xdr_decoder::ResourceFeeBreakdown,
+        crate::xdr_decoder::DecodedInvocation,
+        crate::xdr_decoder::ReplaySource,
+        crate::simulation::DeployProfile, crate::simulation::UpgradeProfile,
         FeeRecommendationRequest, FeeRecommendationResponse,
         FeeHistoryRequest, FeeHistoryResponse,
         crate::fee_store::LedgerFeeSample,
@@ -2210,6 +2329,24 @@ async fn main() {
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
+
+    // Configure OTLP export only when an endpoint is explicitly supplied.
+    // Both Jaeger OTLP and the OpenTelemetry Collector accept this endpoint.
+    if let Ok(endpoint) = env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        match opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+        {
+            Ok(exporter) => {
+                let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+                    .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                    .build();
+                opentelemetry::global::set_tracer_provider(provider);
+            }
+            Err(error) => eprintln!("Failed to configure OTLP tracing exporter: {error}"),
+        }
+    }
 
     // Config is loaded before the tracing subscriber so `rust_log` (sourced
     // from the `RUST_LOG` env var, defaulting to "info") can drive log level
@@ -2895,6 +3032,9 @@ async fn main() {
     let protected = Router::new()
         .route("/analyze", post(analyze))
         .route("/analyze/wasm", post(analyze_wasm))
+        .route("/analyze/transaction/replay", post(reprofile_historical_transaction))
+        .route("/analyze/wasm/deploy", post(analyze_wasm_deploy))
+        .route("/analyze/wasm/upgrade", post(analyze_wasm_upgrade))
         .route("/analyze/wasm/branches", post(analyze_wasm_branches))
         .route("/analyze/optimize-limits", post(optimize_limits))
         .route("/analyze/compare", post(compare_handler))
@@ -2942,6 +3082,7 @@ async fn main() {
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(trace_propagation::http_trace_middleware))
         // ── x-request-id (#572) ───────────────────────────────────────
         // Assigns a UUID to every inbound request under the `x-request-id`
         // header and propagates it to outbound responses so clients can
@@ -3152,6 +3293,7 @@ mod tests {
                 ledger_write_bytes: 256,
                 transaction_size_bytes: 1024,
             },
+            auth_tree: Default::default(),
             transaction_hash: None,
             latest_ledger: 12345,
             cost_stroops: 5000,
@@ -3241,6 +3383,9 @@ mod tests {
         ));
         let protected = Router::new()
             .route("/analyze/wasm/profile", post(analyze_wasm_profile))
+            .route("/analyze/transaction/replay", post(reprofile_historical_transaction))
+            .route("/analyze/wasm/deploy", post(analyze_wasm_deploy))
+            .route("/analyze/wasm/upgrade", post(analyze_wasm_upgrade))
             .route_layer(middleware::from_fn(auth::auth_middleware));
         let webhook_secret = Arc::new("a-secret-that-is-at-least-thirty-two-bytes".to_string());
         Router::new()

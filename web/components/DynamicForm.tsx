@@ -2,12 +2,12 @@
 
 import React from "react"
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ContractFunction, SimulationInputs } from '../lib/sorobantypes';
 import { Loader2 } from 'lucide-react';
 import { validateField } from '../lib/validationSchemas';
 
-import { simulationQueueManager } from '../lib/requestQueue';
+import { simulationQueueManager, type RequestQueueStatus } from '../lib/requestQueue';
 
 interface DynamicFormProps {
   func: ContractFunction;
@@ -33,6 +33,11 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
   const [formData, setFormData] = useState<SimulationInputs>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [jsonMode, setJsonMode] = useState<Record<string, boolean>>({});
+  const [queueStatus, setQueueStatus] = useState<RequestQueueStatus>(() => simulationQueueManager.getStatus());
+
+  useEffect(() => {
+    return simulationQueueManager.subscribe(setQueueStatus);
+  }, []);
 
   const handleChange = (name: string, value: string | number | boolean) => {
     const updatedData = { ...formData, [name]: value };
@@ -109,6 +114,23 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
 
   return (
     <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+      {queueStatus.isProcessing && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            alignSelf: 'flex-start',
+            border: '1px solid rgba(0, 217, 255, 0.35)',
+            borderRadius: '999px',
+            color: '#00d9ff',
+            backgroundColor: 'rgba(0, 217, 255, 0.08)',
+            fontSize: '12px',
+            padding: '4px 10px',
+          }}
+        >
+          Simulation queue: {queueStatus.waiting} waiting · {queueStatus.active} running · {queueStatus.maxRequestsPerSecond}/sec
+        </div>
+      )}
       {func.inputs.length === 0 ? (
         <p style={{ color: 'var(--text-secondary)', fontSize: '14px' }}>No inputs required</p>
       ) : (

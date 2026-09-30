@@ -135,6 +135,7 @@ impl LocalRunner {
             cost_stroops: estimate_cost_stroops(&resources),
             rent_bytes: None,
             resources,
+            auth_tree: Default::default(),
             transaction_hash: None,
             latest_ledger: 0,
             state_dependency: None,
@@ -181,10 +182,7 @@ fn execute_wasm_invocation(
 /// Match the fee shape of `SimulationEngine::calculate_cost` so results from
 /// the local runner are directly comparable with RPC-sourced results.
 fn estimate_cost_stroops(resources: &SorobanResources) -> u64 {
-    let cpu_cost = resources.cpu_instructions / 10_000;
-    let ram_cost = resources.ram_bytes / 1_024;
-    let ledger_cost = (resources.ledger_read_bytes + resources.ledger_write_bytes) / 1_024;
-    cpu_cost + ram_cost + ledger_cost
+    crate::simulation::estimate_resource_fee_stroops(resources)
 }
 
 /// Build a placeholder `LedgerInfo` suitable for tests and for callers that
