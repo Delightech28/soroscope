@@ -15,9 +15,11 @@ interface WalletContextType {
   connect: (moduleId: string) => Promise<void>;
   disconnect: () => Promise<void>;
   address: string | null;
+  networkName: string;
   isConnected: boolean;
   isConnecting: boolean;
   selectedWalletId: string | null;
+  selectedWalletName: string | null;
   openModal: () => void;
   closeModal: () => void;
   isModalOpen: boolean;
@@ -30,6 +32,13 @@ interface WalletContextType {
 }
 
 const WalletContext = createContext<WalletContextType | undefined>(undefined);
+
+const SUPPORTED_WALLETS = [
+  { id: "freighter", name: "Freighter", icon: "https://stellar.creit.tech/wallet-icons/freighter.png" },
+  { id: "albedo", name: "Albedo", icon: "https://stellar.creit.tech/wallet-icons/albedo.png" },
+  { id: "lobstr", name: "Lobstr", icon: "https://stellar.creit.tech/wallet-icons/lobstr.png" },
+  { id: "xbull", name: "xBull", icon: "https://stellar.creit.tech/wallet-icons/xbull.png" },
+];
 
 export const useWallet = () => {
   const context = useContext(WalletContext);
@@ -150,14 +159,6 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
     localStorage.removeItem("inheritx_wallet_id");
   }, [clearWalletState]);
 
-  const supportedWallets = [
-    { id: "freighter", name: "Freighter", icon: "https://stellar.creit.tech/wallet-icons/freighter.png" },
-    { id: "albedo", name: "Albedo", icon: "https://stellar.creit.tech/wallet-icons/albedo.png" },
-    { id: "xbull", name: "xBull", icon: "https://stellar.creit.tech/wallet-icons/xbull.png" },
-    { id: "rabet", name: "Rabet", icon: "https://stellar.creit.tech/wallet-icons/rabet.png" },
-    { id: "lobstr", name: "Lobstr", icon: "https://stellar.creit.tech/wallet-icons/lobstr.png" },
-  ];
-
   const connectWallet = async (moduleId: string) => {
     if (!kit) {
       setError("Wallet kit not loaded yet");
@@ -207,23 +208,62 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
     setIsModalOpen(false);
   };
 
+  useEffect(() => {
+    const readNextAddress = (event: Event): string | null | undefined => {
+      const detail = (event as CustomEvent).detail as
+        | { address?: string | null; publicKey?: string | null; account?: string | null }
+        | undefined;
+      return detail?.address ?? detail?.publicKey ?? detail?.account;
+    };
+
+    const handleAccountChanged = (event: Event) => {
+      const nextAddress = readNextAddress(event);
+
+      if (nextAddress === null) {
+        resetWalletSession();
+        return;
+      }
+
+      if (typeof nextAddress === "string" && nextAddress.length > 0 && nextAddress !== address) {
+        clearWalletState();
+        setAddress(nextAddress);
+        localStorage.setItem("inheritx_wallet_address", nextAddress);
+      }
+    };
+
+    window.addEventListener("stellar:accountChanged", handleAccountChanged);
+    window.addEventListener("freighter:accountChanged", handleAccountChanged);
+    window.addEventListener("wallet:accountChanged", handleAccountChanged);
+
+    return () => {
+      window.removeEventListener("stellar:accountChanged", handleAccountChanged);
+      window.removeEventListener("freighter:accountChanged", handleAccountChanged);
+      window.removeEventListener("wallet:accountChanged", handleAccountChanged);
+    };
+  }, [address, clearWalletState, resetWalletSession]);
+
+  const selectedWalletName =
+    SUPPORTED_WALLETS.find((wallet) => wallet.id === selectedWalletId)?.name ?? null;
+
   const contextValue = React.useMemo(() => ({
     connect: connectWallet,
     disconnect,
     address,
+    networkName: network.shortName,
     isConnected: !!address,
     isConnecting,
     selectedWalletId,
+    selectedWalletName,
     openModal,
     closeModal,
     isModalOpen,
-    supportedWallets,
+    supportedWallets: SUPPORTED_WALLETS,
     error,
     balances,
     balancesLoading,
     balancesError,
     refreshBalances,
-  }), [address, isConnecting, selectedWalletId, isModalOpen, error, balances, balancesLoading, balancesError, refreshBalances]);
+  }), [address, network.shortName, isConnecting, selectedWalletId, selectedWalletName, isModalOpen, error, balances, balancesLoading, balancesError, refreshBalances]);
 
   return (
     <WalletContext.Provider value={contextValue}>

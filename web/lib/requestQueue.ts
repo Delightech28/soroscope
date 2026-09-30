@@ -10,6 +10,15 @@ export interface RequestQueueOptions {
   maxRequestsPerSecond?: number;
 }
 
+export interface RequestQueueStatus {
+  waiting: number;
+  active: number;
+  isProcessing: boolean;
+  maxRequestsPerSecond: number;
+}
+
+type QueueStatusListener = (status: RequestQueueStatus) => void;
+
 interface QueuedTask<T> {
   task: () => Promise<T>;
   resolve: (value: T | PromiseLike<T>) => void;
@@ -23,6 +32,7 @@ export class RequestQueueManager {
   private lastExecutionTime: number = 0;
   private activeCount: number = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private listeners = new Set<QueueStatusListener>();
 
   constructor(options: RequestQueueOptions = {}) {
     this.maxRequestsPerSecond = options.maxRequestsPerSecond ?? 2;
@@ -35,6 +45,7 @@ export class RequestQueueManager {
   public enqueue<T>(task: () => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       this.queue.push({ task, resolve, reject });
+      this.notifyListeners();
       this.processQueue();
     });
   }
@@ -44,6 +55,23 @@ export class RequestQueueManager {
    */
   public getQueueLength(): number {
     return this.queue.length;
+  }
+
+  public getStatus(): RequestQueueStatus {
+    return {
+      waiting: this.queue.length,
+      active: this.activeCount,
+      isProcessing: this.isProcessing(),
+      maxRequestsPerSecond: this.maxRequestsPerSecond,
+    };
+  }
+
+  public subscribe(listener: QueueStatusListener): () => void {
+    this.listeners.add(listener);
+    listener(this.getStatus());
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
   /**
@@ -63,6 +91,7 @@ export class RequestQueueManager {
     }
     const cancelled = [...this.queue];
     this.queue = [];
+    this.notifyListeners();
     for (const item of cancelled) {
       item.reject(new Error('Request queue cleared'));
     }
@@ -97,6 +126,7 @@ export class RequestQueueManager {
 
     this.activeCount++;
     this.lastExecutionTime = Date.now();
+    this.notifyListeners();
 
     try {
       const promise = nextItem.task();
@@ -105,12 +135,21 @@ export class RequestQueueManager {
         .catch(nextItem.reject)
         .finally(() => {
           this.activeCount = Math.max(0, this.activeCount - 1);
+          this.notifyListeners();
           this.processQueue();
         });
     } catch (err) {
       nextItem.reject(err);
       this.activeCount = Math.max(0, this.activeCount - 1);
+      this.notifyListeners();
       this.processQueue();
+    }
+  }
+
+  private notifyListeners(): void {
+    const status = this.getStatus();
+    for (const listener of this.listeners) {
+      listener(status);
     }
   }
 }

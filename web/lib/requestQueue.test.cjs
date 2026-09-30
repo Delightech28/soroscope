@@ -15,17 +15,34 @@ class RequestQueueManager {
     this.lastExecutionTime = 0;
     this.activeCount = 0;
     this.timer = null;
+    this.listeners = new Set();
   }
 
   enqueue(task) {
     return new Promise((resolve, reject) => {
       this.queue.push({ task, resolve, reject });
+      this.notifyListeners();
       this.processQueue();
     });
   }
 
   getQueueLength() {
     return this.queue.length;
+  }
+
+  getStatus() {
+    return {
+      waiting: this.queue.length,
+      active: this.activeCount,
+      isProcessing: this.isProcessing(),
+      maxRequestsPerSecond: this.maxRequestsPerSecond,
+    };
+  }
+
+  subscribe(listener) {
+    this.listeners.add(listener);
+    listener(this.getStatus());
+    return () => this.listeners.delete(listener);
   }
 
   isProcessing() {
@@ -39,6 +56,7 @@ class RequestQueueManager {
     }
     const cancelled = [...this.queue];
     this.queue = [];
+    this.notifyListeners();
     for (const item of cancelled) {
       item.reject(new Error('Request queue cleared'));
     }
@@ -73,6 +91,7 @@ class RequestQueueManager {
 
     this.activeCount++;
     this.lastExecutionTime = Date.now();
+    this.notifyListeners();
 
     try {
       const promise = nextItem.task();
@@ -81,13 +100,20 @@ class RequestQueueManager {
         .catch(nextItem.reject)
         .finally(() => {
           this.activeCount = Math.max(0, this.activeCount - 1);
+          this.notifyListeners();
           this.processQueue();
         });
     } catch (err) {
       nextItem.reject(err);
       this.activeCount = Math.max(0, this.activeCount - 1);
+      this.notifyListeners();
       this.processQueue();
     }
+  }
+
+  notifyListeners() {
+    const status = this.getStatus();
+    for (const listener of this.listeners) listener(status);
   }
 }
 
@@ -162,4 +188,23 @@ test('wrapWithRateLimit: wraps async function with queue throttling', async () =
 
   const res = await wrapped(10, 20);
   assert.equal(res, 30);
+});
+
+
+test('RequestQueueManager: publishes queue status updates for badges', async () => {
+  const q = new RequestQueueManager({ maxRequestsPerSecond: 20 });
+  const statuses = [];
+  const unsubscribe = q.subscribe((status) => statuses.push(status));
+
+  const task = q.enqueue(() => new Promise((resolve) => setTimeout(() => resolve('done'), 10)));
+
+  assert.equal(statuses[0].waiting, 0);
+  assert.equal(statuses[1].waiting, 1);
+  await task;
+  await new Promise((resolve) => setImmediate(resolve));
+  unsubscribe();
+
+  assert.ok(statuses.some((status) => status.active === 1));
+  assert.ok(statuses.at(-1).isProcessing === false);
+  assert.equal(statuses.at(-1).maxRequestsPerSecond, 20);
 });
