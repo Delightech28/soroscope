@@ -669,6 +669,7 @@ pub struct ResourceReport {
     /// Transaction size in bytes
     #[schema(example = 450)]
     pub transaction_size_bytes: u64,
+    pub bytes_by_durability: crate::simulation::BytesByDurability,
     /// Estimated cost in stroops
     #[schema(example = 1000)]
     pub cost_stroops: u64,
@@ -677,6 +678,8 @@ pub struct ResourceReport {
     pub state_dependency: Option<Vec<StateDependencyReport>>,
     /// TTL status for touched ledger entries and extension suggestions.
     pub ttl_analysis: Option<TtlAnalysisApiReport>,
+    /// Per-key XDR size analysis for written ContractData entries.
+    pub entry_size_analysis: crate::simulation::EntrySizeAnalysis,
     /// Efficiency score (0–100) and optimisation insights.
     pub nutrition: NutritionReport,
     /// Cross-contract call graph
@@ -712,13 +715,16 @@ pub struct TtlAnalysisApiReport {
     pub current_ledger: u64,
     pub touched_entries: Vec<TtlEntryApiReport>,
     pub extend_ttl_suggestions: Vec<ExtendTtlSuggestionApi>,
+    pub restore_ttl_suggestions: Vec<RestoreTtlSuggestionApi>,
 }
 
 #[derive(Serialize, ToSchema)]
 pub struct TtlEntryApiReport {
     pub key: String,
+    pub key_kind: crate::simulation::LedgerKeyKind,
     pub live_until_ledger: u32,
     pub remaining_ledgers: i64,
+    pub entry_xdr_size_bytes: Option<u64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -728,6 +734,23 @@ pub struct ExtendTtlSuggestionApi {
     pub remaining_ledgers: i64,
     pub extend_to_ledger: u32,
     pub ledgers_to_extend_by: u32,
+    pub entry_xdr_size_bytes: Option<u64>,
+    pub estimated_rent_stroops: Option<u64>,
+    pub estimated_instructions: u64,
+    pub estimated_transaction_size_bytes: u64,
+    pub suggested_operation: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct RestoreTtlSuggestionApi {
+    pub key: String,
+    pub current_live_until_ledger: u32,
+    pub remaining_ledgers: i64,
+    pub restore_to_ledger: u32,
+    pub ledgers_to_restore_for: u32,
+    pub entry_xdr_size_bytes: Option<u64>,
+    pub estimated_rent_stroops: Option<u64>,
+    pub estimated_write_stroops: Option<u64>,
     pub suggested_operation: String,
 }
 
@@ -956,8 +979,17 @@ fn to_report(
     insights_engine: &InsightsEngine,
     merkle_tree_root: Option<String>,
 ) -> ResourceReport {
-    let insights_report =
-        insights_engine.analyze_with_auth_tree(&result.resources, &result.auth_tree);
+    let bytes_by_durability = result.bytes_by_durability.reconciled_with(&result.resources);
+    let entry_size_analysis = crate::simulation::analyze_written_entry_sizes(
+        result.state_snapshot.as_ref(),
+        &crate::simulation::extract_written_contract_data_keys(&result.transaction_data),
+        crate::simulation::NetworkLimits::default().max_entry_size_bytes,
+    );
+    let insights_report = insights_engine.analyze_with_durability_and_additional_insights(
+        &result.resources,
+        &bytes_by_durability,
+        entry_size_analysis.insights(),
+    );
 
     ResourceReport {
         cpu_instructions: result.resources.cpu_instructions,
@@ -965,6 +997,7 @@ fn to_report(
         ledger_read_bytes: result.resources.ledger_read_bytes,
         ledger_write_bytes: result.resources.ledger_write_bytes,
         transaction_size_bytes: result.resources.transaction_size_bytes,
+        bytes_by_durability,
         cost_stroops: result.cost_stroops,
         auth_tree: result.auth_tree.clone(),
         state_dependency: result.state_dependency.as_ref().map(|deps| {
@@ -985,8 +1018,10 @@ fn to_report(
                     .iter()
                     .map(|e| TtlEntryApiReport {
                         key: e.key.clone(),
+                        key_kind: e.key_kind,
                         live_until_ledger: e.live_until_ledger,
                         remaining_ledgers: e.remaining_ledgers,
+                        entry_xdr_size_bytes: e.entry_xdr_size_bytes,
                     })
                     .collect(),
                 extend_ttl_suggestions: ttl
@@ -998,10 +1033,30 @@ fn to_report(
                         remaining_ledgers: s.remaining_ledgers,
                         extend_to_ledger: s.extend_to_ledger,
                         ledgers_to_extend_by: s.ledgers_to_extend_by,
+                        entry_xdr_size_bytes: s.entry_xdr_size_bytes,
+                        estimated_rent_stroops: s.estimated_rent_stroops,
+                        estimated_instructions: s.estimated_instructions,
+                        estimated_transaction_size_bytes: s.estimated_transaction_size_bytes,
+                        suggested_operation: s.suggested_operation.clone(),
+                    })
+                    .collect(),
+                restore_ttl_suggestions: ttl
+                    .restore_ttl_suggestions
+                    .iter()
+                    .map(|s| RestoreTtlSuggestionApi {
+                        key: s.key.clone(),
+                        current_live_until_ledger: s.current_live_until_ledger,
+                        remaining_ledgers: s.remaining_ledgers,
+                        restore_to_ledger: s.restore_to_ledger,
+                        ledgers_to_restore_for: s.ledgers_to_restore_for,
+                        entry_xdr_size_bytes: s.entry_xdr_size_bytes,
+                        estimated_rent_stroops: s.estimated_rent_stroops,
+                        estimated_write_stroops: s.estimated_write_stroops,
                         suggested_operation: s.suggested_operation.clone(),
                     })
                     .collect(),
             }),
+        entry_size_analysis,
         nutrition: NutritionReport {
             efficiency_score: insights_report.efficiency_score,
             insights: insights_report
@@ -1301,6 +1356,10 @@ async fn analyze_wasm(
         .inc();
 
     let sim_result = simulation::SimulationResult {
+        bytes_by_durability: simulation::BytesByDurability::from_aggregates_as_other(
+            resources.ledger_read_bytes,
+            resources.ledger_write_bytes,
+        ),
         resources,
         auth_tree: Default::default(),
         transaction_hash: None,
@@ -3224,6 +3283,9 @@ mod tests {
     #[test]
     fn test_resource_report_includes_cost_stroops() {
         let sim_result = SimulationResult {
+            bytes_by_durability: crate::simulation::BytesByDurability::from_aggregates_as_other(
+                512, 256,
+            ),
             resources: SorobanResources {
                 cpu_instructions: 1000000,
                 ram_bytes: 2048,

@@ -241,11 +241,130 @@ pub struct SorobanResources {
     pub amm_tick_profile_report: Option<ConcentratedAmmTickProfileReport>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Default)]
+pub struct DurabilityByteCounts {
+    pub code: u64,
+    pub instance: u64,
+    pub persistent: u64,
+    pub temporary: u64,
+    pub other: u64,
+}
+
+impl DurabilityByteCounts {
+    pub fn total(&self) -> u64 {
+        self.code
+            .saturating_add(self.instance)
+            .saturating_add(self.persistent)
+            .saturating_add(self.temporary)
+            .saturating_add(self.other)
+    }
+
+    pub(crate) fn add(&mut self, kind: LedgerKeyKind, bytes: u64) {
+        let bucket = match kind {
+            LedgerKeyKind::Code => &mut self.code,
+            LedgerKeyKind::Instance => &mut self.instance,
+            LedgerKeyKind::Persistent => &mut self.persistent,
+            LedgerKeyKind::Temporary => &mut self.temporary,
+            LedgerKeyKind::Other => &mut self.other,
+        };
+        *bucket = bucket.saturating_add(bytes);
+    }
+
+    pub fn add_key_xdr(&mut self, key_xdr: &[u8], bytes: u64) {
+        self.add(classify_ledger_key_xdr(key_xdr), bytes);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Default)]
+pub struct BytesByDurability {
+    pub read: DurabilityByteCounts,
+    pub write: DurabilityByteCounts,
+}
+
+impl BytesByDurability {
+    pub fn from_aggregates_as_other(ledger_read_bytes: u64, ledger_write_bytes: u64) -> Self {
+        Self {
+            read: DurabilityByteCounts {
+                other: ledger_read_bytes,
+                ..Default::default()
+            },
+            write: DurabilityByteCounts {
+                other: ledger_write_bytes,
+                ..Default::default()
+            },
+        }
+    }
+
+    pub fn reconciled_with(&self, resources: &SorobanResources) -> Self {
+        let mut reconciled = *self;
+        reconciled.read.other = reconciled.read.other.saturating_add(
+            resources
+                .ledger_read_bytes
+                .saturating_sub(reconciled.read.total()),
+        );
+        reconciled.write.other = reconciled.write.other.saturating_add(
+            resources
+                .ledger_write_bytes
+                .saturating_sub(reconciled.write.total()),
+        );
+        reconciled
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerKeyKind {
+    Code,
+    Instance,
+    Persistent,
+    Temporary,
+    Other,
+}
+
+pub fn classify_ledger_key_b64(key: &str) -> LedgerKeyKind {
+    BASE64
+        .decode(key)
+        .map(|bytes| classify_ledger_key_xdr(&bytes))
+        .unwrap_or(LedgerKeyKind::Other)
+}
+
+pub fn classify_ledger_key(key: &LedgerKey) -> LedgerKeyKind {
+    match key {
+        LedgerKey::ContractCode(_) => LedgerKeyKind::Code,
+        LedgerKey::ContractData(data) if matches!(&data.key, ScVal::LedgerKeyContractInstance) => {
+            LedgerKeyKind::Instance
+        }
+        LedgerKey::ContractData(data) => match data.durability {
+            soroban_sdk::xdr::ContractDataDurability::Persistent => LedgerKeyKind::Persistent,
+            soroban_sdk::xdr::ContractDataDurability::Temporary => LedgerKeyKind::Temporary,
+        },
+        _ => LedgerKeyKind::Other,
+    }
+}
+
+pub fn classify_ledger_key_xdr(key_xdr: &[u8]) -> LedgerKeyKind {
+    LedgerKey::from_xdr(key_xdr, Limits::none())
+        .map(|key| classify_ledger_key(&key))
+        .unwrap_or(LedgerKeyKind::Other)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct NetworkLimits {
     pub max_cpu_instructions: u64,
     pub max_read_entries: u32,
     pub max_write_entries: u32,
+    #[serde(default = "default_max_transaction_size_bytes")]
+    pub max_transaction_size_bytes: u64,
+    #[serde(default = "default_max_entry_size_bytes")]
+    pub max_entry_size_bytes: u64,
+}
+
+fn default_max_transaction_size_bytes() -> u64 {
+    100_000
+}
+
+fn default_max_entry_size_bytes() -> u64 {
+    64 * 1024
 }
 
 impl Default for NetworkLimits {
@@ -254,6 +373,8 @@ impl Default for NetworkLimits {
             max_cpu_instructions: 100_000_000,
             max_read_entries: 40,
             max_write_entries: 20,
+            max_transaction_size_bytes: default_max_transaction_size_bytes(),
+            max_entry_size_bytes: default_max_entry_size_bytes(),
         }
     }
 }
@@ -1204,7 +1325,7 @@ pub struct OptimizationReport {
 pub struct SimulationResult {
     pub resources: SorobanResources,
     #[serde(default)]
-    pub auth_tree: AuthTreeReport,
+    pub bytes_by_durability: BytesByDurability,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction_hash: Option<String>,
     pub latest_ledger: u64,
@@ -1375,6 +1496,183 @@ pub struct SimulationStateSnapshot {
     pub latest_ledger: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryDurability {
+    Persistent,
+    Temporary,
+    Instance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct EntryGrowthProjection {
+    pub bytes_per_call: u64,
+    pub estimated_calls_remaining: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct EntrySizeMeasurement {
+    pub key: String,
+    pub xdr_size_bytes: u64,
+    pub durability: EntryDurability,
+    pub percent_of_max: f64,
+    pub growth_projection: Option<EntryGrowthProjection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct EntrySizeAnalysis {
+    pub max_entry_size_bytes: u64,
+    pub entries: Vec<EntrySizeMeasurement>,
+    pub unmeasured: usize,
+}
+
+impl EntrySizeAnalysis {
+    pub fn insights(&self) -> Vec<crate::insights::Insight> {
+        use crate::insights::{Insight, Severity};
+
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let severity = match (entry.durability, entry.percent_of_max) {
+                    (EntryDurability::Persistent, percent) if percent >= 90.0 => {
+                        Severity::Critical
+                    }
+                    (_, percent) if percent >= 75.0 => Severity::Warning,
+                    _ => return None,
+                };
+                Some(Insight {
+                    severity,
+                    rule: "entry_size_limit".to_string(),
+                    message: format!(
+                        "{} entry {} is {} of {} bytes ({:.1}% of the protocol limit)",
+                        match entry.durability {
+                            EntryDurability::Persistent => "Persistent",
+                            EntryDurability::Temporary => "Temporary",
+                            EntryDurability::Instance => "Instance",
+                        },
+                        entry.key,
+                        entry.xdr_size_bytes,
+                        self.max_entry_size_bytes,
+                        entry.percent_of_max,
+                    ),
+                    suggested_fix: "Reduce the stored value or split it across multiple entries before it reaches the protocol size limit.".to_string(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Analyze only `ContractData` keys in the transaction's write footprint.
+/// Missing snapshots or undecodable XDR are counted rather than treated as zero.
+pub fn analyze_written_entry_sizes(
+    snapshot: Option<&SimulationStateSnapshot>,
+    written_keys: &[String],
+    max_entry_size_bytes: u64,
+) -> EntrySizeAnalysis {
+    use soroban_sdk::xdr::{LedgerEntryData, LedgerKey};
+
+    let mut analysis = EntrySizeAnalysis {
+        max_entry_size_bytes,
+        entries: Vec::new(),
+        unmeasured: 0,
+    };
+
+    for key in written_keys {
+        let Some(key_bytes) = BASE64.decode(key).ok() else {
+            continue;
+        };
+        let Ok(ledger_key) = LedgerKey::from_xdr(&key_bytes, Limits::none()) else {
+            continue;
+        };
+        let kind = classify_ledger_key(&ledger_key);
+        if !matches!(
+            kind,
+            LedgerKeyKind::Instance | LedgerKeyKind::Persistent | LedgerKeyKind::Temporary
+        ) {
+            continue;
+        }
+
+        let Some(entry_xdr) = snapshot.and_then(|snapshot| snapshot.ledger_entries.get(key)) else {
+            analysis.unmeasured += 1;
+            continue;
+        };
+        let Ok(entry_bytes) = BASE64.decode(entry_xdr) else {
+            analysis.unmeasured += 1;
+            continue;
+        };
+        let Ok(entry) = LedgerEntry::from_xdr(&entry_bytes, Limits::none()) else {
+            analysis.unmeasured += 1;
+            continue;
+        };
+        let LedgerEntryData::ContractData(_data) = entry.data else {
+            analysis.unmeasured += 1;
+            continue;
+        };
+
+        let durability = match kind {
+            LedgerKeyKind::Instance => EntryDurability::Instance,
+            LedgerKeyKind::Persistent => EntryDurability::Persistent,
+            LedgerKeyKind::Temporary => EntryDurability::Temporary,
+            _ => unreachable!("non-contract data keys were filtered above"),
+        };
+        let xdr_size_bytes = entry_bytes.len() as u64;
+        let percent_of_max = if max_entry_size_bytes == 0 {
+            100.0
+        } else {
+            xdr_size_bytes as f64 * 100.0 / max_entry_size_bytes as f64
+        };
+        analysis.entries.push(EntrySizeMeasurement {
+            key: key.clone(),
+            xdr_size_bytes,
+            durability,
+            percent_of_max,
+            growth_projection: None,
+        });
+    }
+
+    analysis
+}
+
+/// Estimate calls until the entry reaches its limit, only for positive growth.
+pub fn project_entry_growth(
+    previous_size_bytes: u64,
+    current_size_bytes: u64,
+    max_entry_size_bytes: u64,
+) -> Option<EntryGrowthProjection> {
+    let bytes_per_call = current_size_bytes.checked_sub(previous_size_bytes)?;
+    if bytes_per_call == 0 || current_size_bytes >= max_entry_size_bytes {
+        return None;
+    }
+    let bytes_remaining = max_entry_size_bytes - current_size_bytes;
+    Some(EntryGrowthProjection {
+        bytes_per_call,
+        estimated_calls_remaining: bytes_remaining
+            .saturating_add(bytes_per_call - 1)
+            / bytes_per_call,
+    })
+}
+
+/// Extract written `ContractData` ledger keys from transaction XDR.
+pub fn extract_written_contract_data_keys(transaction_data: &str) -> Vec<String> {
+    let Ok(bytes) = BASE64.decode(transaction_data) else {
+        return Vec::new();
+    };
+    let Ok(data) = SorobanTransactionData::from_xdr(&bytes, Limits::none()) else {
+        return Vec::new();
+    };
+
+    data.resources
+        .footprint
+        .read_write
+        .iter()
+        .filter_map(|key| {
+            matches!(key, LedgerKey::ContractData(_))
+                .then(|| key.to_xdr(Limits::none()).ok().map(|bytes| BASE64.encode(bytes)))
+                .flatten()
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateDependency {
     pub key: String,
@@ -1390,8 +1688,10 @@ pub enum DataSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TtlEntryReport {
     pub key: String,
+    pub key_kind: LedgerKeyKind,
     pub live_until_ledger: u32,
     pub remaining_ledgers: i64,
+    pub entry_xdr_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1401,6 +1701,23 @@ pub struct ExtendTtlSuggestion {
     pub remaining_ledgers: i64,
     pub extend_to_ledger: u32,
     pub ledgers_to_extend_by: u32,
+    pub entry_xdr_size_bytes: Option<u64>,
+    pub estimated_rent_stroops: Option<u64>,
+    pub estimated_instructions: u64,
+    pub estimated_transaction_size_bytes: u64,
+    pub suggested_operation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RestoreTtlSuggestion {
+    pub key: String,
+    pub current_live_until_ledger: u32,
+    pub remaining_ledgers: i64,
+    pub restore_to_ledger: u32,
+    pub ledgers_to_restore_for: u32,
+    pub entry_xdr_size_bytes: Option<u64>,
+    pub estimated_rent_stroops: Option<u64>,
+    pub estimated_write_stroops: Option<u64>,
     pub suggested_operation: String,
 }
 
@@ -1409,6 +1726,189 @@ pub struct TtlAnalysisReport {
     pub current_ledger: u64,
     pub touched_entries: Vec<TtlEntryReport>,
     pub extend_ttl_suggestions: Vec<ExtendTtlSuggestion>,
+    pub restore_ttl_suggestions: Vec<RestoreTtlSuggestion>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TtlBatchLimit {
+    Instructions,
+    WriteEntries,
+    TransactionSizeBytes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ExtendTtlBatch {
+    pub keys: Vec<String>,
+    pub estimated_instructions: u64,
+    pub estimated_write_entries: u32,
+    pub estimated_transaction_size_bytes: u64,
+    pub estimated_resource_fee_stroops: Option<u64>,
+    /// The limit that prevented the next soonest-expiring key from fitting.
+    pub bound_by: Option<TtlBatchLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("extension suggestion for key {key} alone exceeds the {bound_by:?} limit")]
+pub struct TtlBatchPlanningError {
+    pub key: String,
+    pub bound_by: TtlBatchLimit,
+}
+
+const TTL_BATCH_BASE_TRANSACTION_SIZE_BYTES: u64 = 256;
+const TTL_EXTENSION_ESTIMATED_INSTRUCTIONS_PER_KEY: u64 = 100_000;
+const TTL_EXTENSION_TX_OVERHEAD_PER_KEY_BYTES: u64 = 64;
+
+/// Pack live TTL extensions into ordered batches that fit the supplied limits.
+///
+/// The CPU estimate is a conservative per-key planning heuristic. Transaction
+/// size uses the encoded ledger-key size plus fixed XDR overhead estimates.
+/// This function performs no RPC and reports an error if a single key cannot
+/// fit by itself.
+pub fn plan_extend_ttl_batches(
+    suggestions: &[ExtendTtlSuggestion],
+    limits: &NetworkLimits,
+) -> Result<Vec<ExtendTtlBatch>, TtlBatchPlanningError> {
+    let mut ordered: Vec<_> = suggestions
+        .iter()
+        .filter(|suggestion| suggestion.remaining_ledgers >= 0)
+        .collect();
+    ordered.sort_by_key(|suggestion| suggestion.remaining_ledgers);
+
+    let mut batches = Vec::new();
+    let mut current = TtlBatchBuilder::new();
+
+    for suggestion in ordered {
+        let empty_batch = TtlBatchBuilder::new();
+        if let Some(bound_by) = empty_batch.bound_for(suggestion, limits) {
+            return Err(TtlBatchPlanningError {
+                key: suggestion.key.clone(),
+                bound_by,
+            });
+        }
+
+        if let Some(bound_by) = current.bound_for(suggestion, limits) {
+            current.bound_by = Some(bound_by);
+            batches.push(current.finish());
+            current = TtlBatchBuilder::new();
+        }
+        current.push(suggestion);
+    }
+
+    if !current.suggestions.is_empty() {
+        batches.push(current.finish());
+    }
+
+    Ok(batches)
+}
+
+struct TtlBatchBuilder<'a> {
+    suggestions: Vec<&'a ExtendTtlSuggestion>,
+    estimated_instructions: u64,
+    estimated_transaction_size_bytes: u64,
+    bound_by: Option<TtlBatchLimit>,
+}
+
+impl<'a> TtlBatchBuilder<'a> {
+    fn new() -> Self {
+        Self {
+            suggestions: Vec::new(),
+            estimated_instructions: 0,
+            estimated_transaction_size_bytes: TTL_BATCH_BASE_TRANSACTION_SIZE_BYTES,
+            bound_by: None,
+        }
+    }
+
+    fn bound_for(
+        &self,
+        suggestion: &ExtendTtlSuggestion,
+        limits: &NetworkLimits,
+    ) -> Option<TtlBatchLimit> {
+        if self
+            .estimated_instructions
+            .saturating_add(suggestion.estimated_instructions)
+            > limits.max_cpu_instructions
+        {
+            return Some(TtlBatchLimit::Instructions);
+        }
+        if self.suggestions.len() >= limits.max_write_entries as usize {
+            return Some(TtlBatchLimit::WriteEntries);
+        }
+        if self
+            .estimated_transaction_size_bytes
+            .saturating_add(suggestion.estimated_transaction_size_bytes)
+            > limits.max_transaction_size_bytes
+        {
+            return Some(TtlBatchLimit::TransactionSizeBytes);
+        }
+        None
+    }
+
+    fn push(&mut self, suggestion: &'a ExtendTtlSuggestion) {
+        self.suggestions.push(suggestion);
+        self.estimated_instructions = self
+            .estimated_instructions
+            .saturating_add(suggestion.estimated_instructions);
+        self.estimated_transaction_size_bytes = self
+            .estimated_transaction_size_bytes
+            .saturating_add(suggestion.estimated_transaction_size_bytes);
+    }
+
+    fn finish(self) -> ExtendTtlBatch {
+        let estimated_write_entries = self.suggestions.len().min(u32::MAX as usize) as u32;
+        let estimated_resource_fee_stroops = estimate_ttl_batch_fee(
+            &self.suggestions,
+            self.estimated_instructions,
+            self.estimated_transaction_size_bytes,
+        );
+        ExtendTtlBatch {
+            keys: self
+                .suggestions
+                .iter()
+                .map(|suggestion| suggestion.key.clone())
+                .collect(),
+            estimated_instructions: self.estimated_instructions,
+            estimated_write_entries,
+            estimated_transaction_size_bytes: self.estimated_transaction_size_bytes,
+            estimated_resource_fee_stroops,
+            bound_by: self.bound_by,
+        }
+    }
+}
+
+fn estimate_ttl_batch_fee(
+    suggestions: &[&ExtendTtlSuggestion],
+    estimated_instructions: u64,
+    estimated_transaction_size_bytes: u64,
+) -> Option<u64> {
+    use crate::fee_quote::{DurabilitySplit, FeeQuoteInput, ResourceFeeQuote, SorobanFeeConfig};
+
+    let config = SorobanFeeConfig::checked_in();
+    let mut temporary_rent_bytes = 0u64;
+    let mut persistent_rent_bytes = 0u64;
+
+    for suggestion in suggestions {
+        let size = suggestion.entry_xdr_size_bytes?;
+        let rent_bytes = size.saturating_mul(suggestion.ledgers_to_extend_by as u64);
+        if SimulationEngine::is_temporary_entry(&suggestion.key) {
+            temporary_rent_bytes = temporary_rent_bytes.saturating_add(rent_bytes);
+        } else {
+            persistent_rent_bytes = persistent_rent_bytes.saturating_add(rent_bytes);
+        }
+    }
+
+    let rent_bytes = temporary_rent_bytes.saturating_add(persistent_rent_bytes);
+    let input = FeeQuoteInput {
+        cpu_instructions: estimated_instructions,
+        ledger_write_bytes: (config.ttl_entry_size.max(0) as u64)
+            .saturating_mul(suggestions.len() as u64),
+        transaction_size_bytes: estimated_transaction_size_bytes,
+        write_entries: suggestions.len() as u64,
+        rent_bytes: Some(rent_bytes),
+        ..FeeQuoteInput::default()
+    };
+    let split = DurabilitySplit::mixed(temporary_rent_bytes, persistent_rent_bytes);
+    Some(ResourceFeeQuote::estimate(&input, split, config).gross_resource_fee)
 }
 
 #[derive(Debug, Serialize)]
@@ -1579,7 +2079,6 @@ struct GetLedgerEntriesResult {
 #[serde(rename_all = "camelCase")]
 struct LedgerEntryWithMeta {
     key: String,
-    #[allow(dead_code)]
     xdr: Option<String>,
     live_until_ledger_seq: Option<u32>,
 }
@@ -3013,7 +3512,8 @@ impl SimulationEngine {
                         )
                         .await
                     {
-                        Ok(ttl_report) => {
+                        Ok((ttl_report, snapshot)) => {
+                            parsed.state_snapshot = Some(snapshot);
                             if !ttl_report.touched_entries.is_empty() {
                                 parsed.ttl_analysis = Some(ttl_report);
                             }
@@ -3143,9 +3643,14 @@ impl SimulationEngine {
         auth_value: Option<&str>,
         touched_keys: &[String],
         latest_ledger: u64,
-    ) -> Result<TtlAnalysisReport, SimulationError> {
+    ) -> Result<(TtlAnalysisReport, SimulationStateSnapshot), SimulationError> {
         let mut missing_keys = Vec::new();
         let mut cached_reports = Vec::new();
+        let mut snapshot = SimulationStateSnapshot {
+            ledger_entries: HashMap::new(),
+            ttl_entries: HashMap::new(),
+            latest_ledger,
+        };
 
         if let Some(cache) = &self.contract_cache {
             for key in touched_keys {
@@ -3153,11 +3658,24 @@ impl SimulationEngine {
                     if let Ok(entry_meta) =
                         serde_json::from_slice::<LedgerEntryWithMeta>(&entry_bytes)
                     {
+                        if let Some(entry_xdr) = &entry_meta.xdr {
+                            snapshot
+                                .ledger_entries
+                                .insert(entry_meta.key.clone(), entry_xdr.clone());
+                        }
                         if let Some(live_until) = entry_meta.live_until_ledger_seq {
+                            snapshot
+                                .ttl_entries
+                                .insert(entry_meta.key.clone(), live_until);
                             cached_reports.push(TtlEntryReport {
-                                key: entry_meta.key,
+                                key: entry_meta.key.clone(),
+                                key_kind: classify_ledger_key_b64(&entry_meta.key),
                                 live_until_ledger: live_until,
                                 remaining_ledgers: live_until as i64 - latest_ledger as i64,
+                                entry_xdr_size_bytes: entry_meta
+                                    .xdr
+                                    .as_deref()
+                                    .and_then(Self::entry_xdr_size_bytes),
                             });
                             continue;
                         }
@@ -3172,11 +3690,17 @@ impl SimulationEngine {
         if missing_keys.is_empty() {
             let extend_ttl_suggestions =
                 Self::build_extend_ttl_suggestions(&cached_reports, latest_ledger);
-            return Ok(TtlAnalysisReport {
-                current_ledger: latest_ledger,
-                touched_entries: cached_reports,
-                extend_ttl_suggestions,
-            });
+            let restore_ttl_suggestions =
+                Self::build_restore_ttl_suggestions(&cached_reports, latest_ledger);
+            return Ok((
+                TtlAnalysisReport {
+                    current_ledger: latest_ledger,
+                    touched_entries: cached_reports,
+                    extend_ttl_suggestions,
+                    restore_ttl_suggestions,
+                },
+                snapshot,
+            ));
         }
 
         let req = GetLedgerEntriesRequest {
@@ -3223,6 +3747,16 @@ impl SimulationEngine {
 
         let mut all_reports = cached_reports;
         for entry in fetched_entries {
+            if let Some(entry_xdr) = &entry.xdr {
+                snapshot
+                    .ledger_entries
+                    .insert(entry.key.clone(), entry_xdr.clone());
+            }
+            if let Some(live_until) = entry.live_until_ledger_seq {
+                snapshot
+                    .ttl_entries
+                    .insert(entry.key.clone(), live_until);
+            }
             if let Some(cache) = &self.contract_cache {
                 if let Ok(bytes) = serde_json::to_vec(&entry) {
                     cache.set_ledger_entry(entry.key.clone(), bytes, latest_ledger);
@@ -3231,21 +3765,36 @@ impl SimulationEngine {
 
             if let Some(live_until) = entry.live_until_ledger_seq {
                 all_reports.push(TtlEntryReport {
-                    key: entry.key,
+                    key: entry.key.clone(),
+                    key_kind: classify_ledger_key_b64(&entry.key),
                     live_until_ledger: live_until,
                     remaining_ledgers: live_until as i64 - latest_ledger as i64,
+                    entry_xdr_size_bytes: entry
+                        .xdr
+                        .as_deref()
+                        .and_then(Self::entry_xdr_size_bytes),
                 });
             }
         }
 
         let extend_ttl_suggestions =
             Self::build_extend_ttl_suggestions(&all_reports, latest_ledger);
+        let restore_ttl_suggestions =
+            Self::build_restore_ttl_suggestions(&all_reports, latest_ledger);
 
-        Ok(TtlAnalysisReport {
-            current_ledger: latest_ledger,
-            touched_entries: all_reports,
-            extend_ttl_suggestions,
-        })
+        Ok((
+            TtlAnalysisReport {
+                current_ledger: latest_ledger,
+                touched_entries: all_reports,
+                extend_ttl_suggestions,
+                restore_ttl_suggestions,
+            },
+            snapshot,
+        ))
+    }
+
+    fn entry_xdr_size_bytes(entry_xdr: &str) -> Option<u64> {
+        BASE64.decode(entry_xdr).ok().map(|bytes| bytes.len() as u64)
     }
 
     pub(crate) fn build_extend_ttl_suggestions(
@@ -3255,7 +3804,9 @@ impl SimulationEngine {
         touched_entries
             .iter()
             .filter_map(|entry| {
-                if entry.remaining_ledgers > Self::TTL_WARNING_THRESHOLD_LEDGERS {
+                if entry.remaining_ledgers < 0
+                    || entry.remaining_ledgers > Self::TTL_WARNING_THRESHOLD_LEDGERS
+                {
                     return None;
                 }
 
@@ -3266,12 +3817,24 @@ impl SimulationEngine {
                     .clamp(0, u32::MAX as i64) as u32;
                 let ledgers_to_extend_by = extend_to_ledger.saturating_sub(entry.live_until_ledger);
 
+                let estimated_rent_stroops = entry.entry_xdr_size_bytes.map(|size| {
+                    crate::fee_quote::SorobanFeeConfig::checked_in().estimate_entry_rent_stroops(
+                        size,
+                        ledgers_to_extend_by,
+                        Self::is_temporary_entry(&entry.key),
+                    )
+                });
+
                 Some(ExtendTtlSuggestion {
                     key: entry.key.clone(),
                     current_live_until_ledger: entry.live_until_ledger,
                     remaining_ledgers: entry.remaining_ledgers,
                     extend_to_ledger,
                     ledgers_to_extend_by,
+                    entry_xdr_size_bytes: entry.entry_xdr_size_bytes,
+                    estimated_rent_stroops,
+                    estimated_instructions: TTL_EXTENSION_ESTIMATED_INSTRUCTIONS_PER_KEY,
+                    estimated_transaction_size_bytes: Self::estimate_key_tx_size_bytes(&entry.key),
                     suggested_operation: format!(
                         "env.storage().persistent().extend_ttl(<key>, {}, {})",
                         Self::TTL_WARNING_THRESHOLD_LEDGERS,
@@ -3282,11 +3845,77 @@ impl SimulationEngine {
             .collect()
     }
 
+    pub(crate) fn build_restore_ttl_suggestions(
+        touched_entries: &[TtlEntryReport],
+        latest_ledger: u64,
+    ) -> Vec<RestoreTtlSuggestion> {
+        touched_entries
+            .iter()
+            .filter_map(|entry| {
+                if entry.remaining_ledgers >= 0 {
+                    return None;
+                }
+
+                let latest_ledger_i64 = i64::try_from(latest_ledger).unwrap_or(i64::MAX);
+                let restore_to_ledger = latest_ledger_i64
+                    .saturating_add(Self::TTL_TARGET_LEDGERS_AHEAD)
+                    .clamp(0, u32::MAX as i64) as u32;
+                let current_ledger = u32::try_from(latest_ledger).unwrap_or(u32::MAX);
+                let ledgers_to_restore_for = restore_to_ledger.saturating_sub(current_ledger);
+                let config = crate::fee_quote::SorobanFeeConfig::checked_in();
+                let temporary = Self::is_temporary_entry(&entry.key);
+                let estimated_rent_stroops = entry.entry_xdr_size_bytes.map(|size| {
+                    config.estimate_entry_rent_stroops(size, ledgers_to_restore_for, temporary)
+                });
+                let estimated_write_stroops = entry
+                    .entry_xdr_size_bytes
+                    .map(|size| config.estimate_restore_write_stroops(size));
+
+                Some(RestoreTtlSuggestion {
+                    key: entry.key.clone(),
+                    current_live_until_ledger: entry.live_until_ledger,
+                    remaining_ledgers: entry.remaining_ledgers,
+                    restore_to_ledger,
+                    ledgers_to_restore_for,
+                    entry_xdr_size_bytes: entry.entry_xdr_size_bytes,
+                    estimated_rent_stroops,
+                    estimated_write_stroops,
+                    suggested_operation: "RestoreFootprint".to_string(),
+                })
+            })
+            .collect()
+    }
+
+    fn is_temporary_entry(key: &str) -> bool {
+        use soroban_sdk::xdr::{ContractDataDurability, LedgerKey};
+
+        BASE64
+            .decode(key)
+            .ok()
+            .and_then(|bytes| LedgerKey::from_xdr(&bytes, Limits::none()).ok())
+            .is_some_and(|key| {
+                matches!(
+                    key,
+                    LedgerKey::ContractData(data)
+                        if data.durability == ContractDataDurability::Temporary
+                )
+            })
+    }
+
+    fn estimate_key_tx_size_bytes(key: &str) -> u64 {
+        let key_bytes = BASE64
+            .decode(key)
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or(key.len() as u64);
+        key_bytes.saturating_add(TTL_EXTENSION_TX_OVERHEAD_PER_KEY_BYTES)
+    }
+
     pub(crate) fn parse_simulation_result(
         &self,
         rpc_result: SimulationRpcResult,
     ) -> Result<SimulationResult, SimulationError> {
         let mut rent_bytes: Option<u64> = None;
+        let mut bytes_by_durability = BytesByDurability::default();
         let resources = if let Some(cost) = rpc_result.cost {
             let cpu_instructions = cost.cpu_insns.parse::<u64>().unwrap_or_else(|_| {
                 tracing::warn!("Failed to parse cpu_insns, using 0");
@@ -3309,8 +3938,10 @@ impl SimulationEngine {
                         None
                     }
                 });
-            let (ledger_read_bytes, ledger_write_bytes) =
-                self.extract_footprint_from_xdr(&rpc_result.transaction_data);
+            bytes_by_durability =
+                self.extract_footprint_bytes_by_durability(&rpc_result.transaction_data);
+            let ledger_read_bytes = bytes_by_durability.read.total();
+            let ledger_write_bytes = bytes_by_durability.write.total();
             SorobanResources {
                 cpu_instructions,
                 ram_bytes,
@@ -3326,7 +3957,7 @@ impl SimulationEngine {
         let cost_stroops = self.calculate_cost(&resources);
         Ok(SimulationResult {
             resources,
-            auth_tree: AuthTreeReport::default(),
+            bytes_by_durability,
             transaction_hash: None,
             latest_ledger: rpc_result.latest_ledger,
             cost_stroops,
@@ -3341,58 +3972,75 @@ impl SimulationEngine {
     }
 
     pub(crate) fn extract_footprint_from_xdr(&self, transaction_data: &str) -> (u64, u64) {
+        let bytes = self.extract_footprint_bytes_by_durability(transaction_data);
+        (bytes.read.total(), bytes.write.total())
+    }
+
+    pub(crate) fn extract_footprint_bytes_by_durability(
+        &self,
+        transaction_data: &str,
+    ) -> BytesByDurability {
         if transaction_data.is_empty() {
-            return (0, 0);
+            return BytesByDurability::default();
         }
         let xdr_bytes = match BASE64.decode(transaction_data) {
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::warn!("Failed to decode base64 transaction data: {}", e);
-                return (0, 0);
+                return BytesByDurability::default();
             }
         };
         let soroban_data = match SorobanTransactionData::from_xdr(&xdr_bytes, Limits::none()) {
             Ok(data) => data,
             Err(e) => {
                 tracing::warn!("Failed to parse SorobanTransactionData XDR: {}", e);
-                return (0, 0);
+                return BytesByDurability::default();
             }
         };
         let footprint = &soroban_data.resources.footprint;
-        let read_bytes = self.calculate_ledger_keys_size(&footprint.read_only);
-        let write_bytes = self.calculate_ledger_keys_size(&footprint.read_write);
+        let read = self.calculate_ledger_keys_bytes_by_durability(&footprint.read_only);
+        let write = self.calculate_ledger_keys_bytes_by_durability(&footprint.read_write);
         tracing::debug!(
             "Extracted footprint: read_only={} keys ({} bytes), read_write={} keys ({} bytes)",
             footprint.read_only.len(),
-            read_bytes,
+            read.total(),
             footprint.read_write.len(),
-            write_bytes
+            write.total()
         );
-        (read_bytes, write_bytes)
+        BytesByDurability { read, write }
     }
 
-    fn calculate_ledger_keys_size(&self, ledger_keys: &soroban_sdk::xdr::VecM<LedgerKey>) -> u64 {
-        let mut total_bytes: u64 = 0;
+    fn calculate_ledger_keys_bytes_by_durability(
+        &self,
+        ledger_keys: &soroban_sdk::xdr::VecM<LedgerKey>,
+    ) -> DurabilityByteCounts {
+        let mut bytes = DurabilityByteCounts::default();
         for ledger_key in ledger_keys.iter() {
-            let key_size = match ledger_key {
-                LedgerKey::Account(_) => 56,
-                LedgerKey::Trustline(_) => 72,
-                LedgerKey::ContractData(contract_data) => {
-                    let base_size = 32 + 4;
-                    let key_estimate = self.estimate_scval_size(&contract_data.key);
-                    base_size + key_estimate
-                }
-                LedgerKey::ContractCode(_) => 32,
-                LedgerKey::Offer(_) => 48,
-                LedgerKey::Data(_) => 64,
-                LedgerKey::ClaimableBalance(_) => 36,
-                LedgerKey::LiquidityPool(_) => 32,
-                LedgerKey::ConfigSetting(_) => 8,
-                LedgerKey::Ttl(_) => 32,
-            };
-            total_bytes += key_size;
+            bytes.add(
+                classify_ledger_key(ledger_key),
+                self.estimate_ledger_key_size(ledger_key),
+            );
         }
-        total_bytes
+        bytes
+    }
+
+    fn estimate_ledger_key_size(&self, ledger_key: &LedgerKey) -> u64 {
+        match ledger_key {
+            LedgerKey::Account(_) => 56,
+            LedgerKey::Trustline(_) => 72,
+            LedgerKey::ContractData(contract_data) => {
+                let base_size = 32 + 4;
+                let key_estimate = self.estimate_scval_size(&contract_data.key);
+                base_size + key_estimate
+            }
+            LedgerKey::ContractCode(_) => 32,
+            LedgerKey::Offer(_) => 48,
+            LedgerKey::Data(_) => 64,
+            LedgerKey::ClaimableBalance(_) => 36,
+            LedgerKey::LiquidityPool(_) => 32,
+            LedgerKey::ConfigSetting(_) => 8,
+            LedgerKey::Ttl(_) => 32,
+        }
     }
 
     /// Estimate the size of an ScVal in bytes
@@ -4682,6 +5330,7 @@ mod tests {
     fn test_consensus_fingerprint_ignores_latest_ledger() {
         let engine = SimulationEngine::new("https://test.com".to_string());
         let first = SimulationResult {
+            bytes_by_durability: BytesByDurability::from_aggregates_as_other(10, 20),
             resources: SorobanResources {
                 cpu_instructions: 100,
                 ram_bytes: 200,
@@ -4716,6 +5365,7 @@ mod tests {
     fn test_consensus_fingerprint_detects_resource_mismatch() {
         let engine = SimulationEngine::new("https://test.com".to_string());
         let first = SimulationResult {
+            bytes_by_durability: BytesByDurability::from_aggregates_as_other(10, 20),
             resources: SorobanResources {
                 cpu_instructions: 100,
                 ram_bytes: 200,
@@ -4964,6 +5614,68 @@ mod tests {
     }
 
     #[test]
+    fn test_mixed_footprint_durability_buckets_preserve_aggregate() {
+        use soroban_sdk::xdr::{ContractDataDurability, LedgerKeyContractData, ScAddress};
+
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let contract = ScAddress::Contract(Hash([7u8; 32]));
+        let contract_data_key = |key: ScVal, durability| {
+            LedgerKey::ContractData(LedgerKeyContractData {
+                contract: contract.clone(),
+                key,
+                durability,
+            })
+        };
+        let keys: VecM<LedgerKey> = vec![
+            LedgerKey::ContractCode(LedgerKeyContractCode {
+                hash: Hash([1u8; 32]),
+            }),
+            contract_data_key(
+                ScVal::LedgerKeyContractInstance,
+                ContractDataDurability::Persistent,
+            ),
+            contract_data_key(ScVal::U32(1), ContractDataDurability::Persistent),
+            contract_data_key(ScVal::U32(2), ContractDataDurability::Temporary),
+        ]
+        .try_into()
+        .unwrap();
+
+        let xdr_kinds: Vec<_> = keys
+            .iter()
+            .map(|key| classify_ledger_key_xdr(&key.to_xdr(Limits::none()).unwrap()))
+            .collect();
+        assert_eq!(
+            xdr_kinds,
+            vec![
+                LedgerKeyKind::Code,
+                LedgerKeyKind::Instance,
+                LedgerKeyKind::Persistent,
+                LedgerKeyKind::Temporary,
+            ]
+        );
+
+        let expected_legacy_total = keys
+            .iter()
+            .map(|key| engine.estimate_ledger_key_size(key))
+            .sum::<u64>();
+        let breakdown = engine.calculate_ledger_keys_bytes_by_durability(&keys);
+
+        assert_eq!(breakdown.total(), expected_legacy_total);
+        assert!(breakdown.code > 0);
+        assert!(breakdown.instance > 0);
+        assert!(breakdown.persistent > 0);
+        assert!(breakdown.temporary > 0);
+    }
+
+    #[test]
+    fn test_undecodable_key_xdr_is_counted_as_other() {
+        let mut breakdown = DurabilityByteCounts::default();
+        breakdown.add_key_xdr(b"not-xdr", 37);
+        assert_eq!(breakdown.other, 37);
+        assert_eq!(breakdown.total(), 37);
+    }
+
+    #[test]
     fn test_extract_soroban_budget_limits_v21_format() {
         let log = "INFO soroban_cli: budget: cpu: 100000, mem: 2048";
         assert_eq!(extract_soroban_budget_limits(log), Some((100000, 2048)));
@@ -5101,6 +5813,7 @@ mod tests {
 
         fn make_result() -> SimulationResult {
             SimulationResult {
+                bytes_by_durability: BytesByDurability::from_aggregates_as_other(512, 256),
                 resources: SorobanResources {
                     cpu_instructions: 1_000,
                     ram_bytes: 2_000,
@@ -5351,13 +6064,24 @@ mod tests {
         let entries = vec![
             TtlEntryReport {
                 key: "key-a".to_string(),
+                key_kind: LedgerKeyKind::Other,
                 live_until_ledger: 1_000,
                 remaining_ledgers: 500,
+                entry_xdr_size_bytes: Some(1_024),
             },
             TtlEntryReport {
                 key: "key-b".to_string(),
+                key_kind: LedgerKeyKind::Other,
                 live_until_ledger: 500_000,
                 remaining_ledgers: 200_000,
+                entry_xdr_size_bytes: Some(1_024),
+            },
+            TtlEntryReport {
+                key: "key-c".to_string(),
+                key_kind: LedgerKeyKind::Other,
+                live_until_ledger: 100,
+                remaining_ledgers: -400,
+                entry_xdr_size_bytes: Some(1_024),
             },
         ];
 
@@ -5365,6 +6089,286 @@ mod tests {
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].key, "key-a");
         assert!(suggestions[0].ledgers_to_extend_by > 0);
+        assert!(suggestions[0].estimated_rent_stroops.unwrap() > 0);
+
+        let restore_suggestions = SimulationEngine::build_restore_ttl_suggestions(&entries, 500);
+        assert_eq!(restore_suggestions.len(), 1);
+        assert_eq!(restore_suggestions[0].key, "key-c");
+        assert_eq!(restore_suggestions[0].suggested_operation, "RestoreFootprint");
+        assert!(restore_suggestions[0].estimated_rent_stroops.unwrap() > 0);
+        assert!(restore_suggestions[0].estimated_write_stroops.unwrap() > 0);
+    }
+
+    fn ttl_batch_test_suggestion(
+        key: &str,
+        remaining_ledgers: i64,
+        estimated_instructions: u64,
+        estimated_transaction_size_bytes: u64,
+    ) -> ExtendTtlSuggestion {
+        ExtendTtlSuggestion {
+            key: key.to_string(),
+            current_live_until_ledger: 100,
+            remaining_ledgers,
+            extend_to_ledger: 200,
+            ledgers_to_extend_by: 100,
+            entry_xdr_size_bytes: Some(1_024),
+            estimated_rent_stroops: Some(1),
+            estimated_instructions,
+            estimated_transaction_size_bytes,
+            suggested_operation: "extend_ttl".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_ttl_batch_planner_one_key_and_exact_limits() {
+        let suggestion = ttl_batch_test_suggestion("key-a", 10, 10, 44);
+        let limits = NetworkLimits {
+            max_cpu_instructions: 10,
+            max_read_entries: 0,
+            max_write_entries: 1,
+            max_transaction_size_bytes: TTL_BATCH_BASE_TRANSACTION_SIZE_BYTES + 44,
+            max_entry_size_bytes: 64 * 1024,
+        };
+
+        let batches = plan_extend_ttl_batches(&[suggestion], &limits).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].keys, vec!["key-a"]);
+        assert_eq!(batches[0].estimated_instructions, 10);
+        assert_eq!(batches[0].estimated_write_entries, 1);
+        assert_eq!(
+            batches[0].estimated_transaction_size_bytes,
+            limits.max_transaction_size_bytes
+        );
+        assert!(batches[0].estimated_resource_fee_stroops.is_some());
+        assert_eq!(batches[0].bound_by, None);
+    }
+
+    #[test]
+    fn test_ttl_batch_planner_one_past_limit_and_stable_order() {
+        let suggestions = vec![
+            ttl_batch_test_suggestion("later", 20, 1, 8),
+            ttl_batch_test_suggestion("soonest", 2, 1, 8),
+            ttl_batch_test_suggestion("same-expiry", 2, 1, 8),
+            ttl_batch_test_suggestion("archived", -1, 1, 8),
+        ];
+        let limits = NetworkLimits {
+            max_cpu_instructions: 10,
+            max_read_entries: 0,
+            max_write_entries: 1,
+            max_transaction_size_bytes: 1_000,
+            max_entry_size_bytes: 64 * 1024,
+        };
+
+        let batches = plan_extend_ttl_batches(&suggestions, &limits).unwrap();
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].keys, vec!["soonest"]);
+        assert_eq!(batches[1].keys, vec!["same-expiry"]);
+        assert_eq!(batches[2].keys, vec!["later"]);
+        assert_eq!(batches[0].bound_by, Some(TtlBatchLimit::WriteEntries));
+        assert_eq!(batches[1].bound_by, Some(TtlBatchLimit::WriteEntries));
+        for batch in batches {
+            assert!(batch.estimated_instructions <= limits.max_cpu_instructions);
+            assert!(batch.estimated_write_entries <= limits.max_write_entries);
+            assert!(batch.estimated_transaction_size_bytes <= limits.max_transaction_size_bytes);
+        }
+    }
+
+    #[test]
+    fn test_ttl_batch_planner_empty_input() {
+        assert!(plan_extend_ttl_batches(&[], &NetworkLimits::default())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_ttl_batch_planner_rejects_single_key_over_each_limit() {
+        let suggestion = ttl_batch_test_suggestion("key-a", 10, 11, 45);
+        let base_limits = NetworkLimits {
+            max_cpu_instructions: 10,
+            max_read_entries: 0,
+            max_write_entries: 1,
+            max_transaction_size_bytes: TTL_BATCH_BASE_TRANSACTION_SIZE_BYTES + 45,
+            max_entry_size_bytes: 64 * 1024,
+        };
+
+        assert_eq!(
+            plan_extend_ttl_batches(&[suggestion.clone()], &base_limits)
+                .unwrap_err()
+                .bound_by,
+            TtlBatchLimit::Instructions
+        );
+
+        let mut limits = base_limits.clone();
+        limits.max_cpu_instructions = 100;
+        limits.max_write_entries = 0;
+        assert_eq!(
+            plan_extend_ttl_batches(&[suggestion.clone()], &limits)
+                .unwrap_err()
+                .bound_by,
+            TtlBatchLimit::WriteEntries
+        );
+
+        limits.max_write_entries = 1;
+        limits.max_transaction_size_bytes -= 1;
+        assert_eq!(
+            plan_extend_ttl_batches(&[suggestion], &limits)
+                .unwrap_err()
+                .bound_by,
+            TtlBatchLimit::TransactionSizeBytes
+        );
+    }
+
+    #[test]
+    fn test_entry_size_insights_use_durability_thresholds() {
+        let measurement = |key: &str, size: u64, durability| EntrySizeMeasurement {
+            key: key.to_string(),
+            xdr_size_bytes: size,
+            durability,
+            percent_of_max: size as f64,
+            growth_projection: None,
+        };
+        let analysis = EntrySizeAnalysis {
+            max_entry_size_bytes: 100,
+            entries: vec![
+                measurement("persistent-50", 50, EntryDurability::Persistent),
+                measurement("persistent-80", 80, EntryDurability::Persistent),
+                measurement("persistent-95", 95, EntryDurability::Persistent),
+                measurement("instance-95", 95, EntryDurability::Instance),
+                measurement("temporary-95", 95, EntryDurability::Temporary),
+            ],
+            unmeasured: 0,
+        };
+
+        let insights = analysis.insights();
+        assert_eq!(insights.len(), 4);
+        assert_eq!(
+            insights
+                .iter()
+                .filter(|insight| insight.severity == crate::insights::Severity::Critical)
+                .count(),
+            1
+        );
+        let critical = insights
+            .iter()
+            .find(|insight| insight.severity == crate::insights::Severity::Critical)
+            .unwrap();
+        assert!(critical.message.contains("persistent-95"));
+        assert!(critical.message.contains("95 of 100 bytes"));
+        assert!(!insights
+            .iter()
+            .any(|insight| insight.message.contains("persistent-50")));
+    }
+
+    #[test]
+    fn test_entry_size_analysis_reports_instance_and_temporary_entries() {
+        use soroban_sdk::xdr::{
+            ContractDataEntry, ContractDataDurability, ContractExecutable, ExtensionPoint,
+            LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyContractData,
+            ScAddress, ScContractInstance, ScVal, WriteXdr,
+        };
+
+        let contract = ScAddress::Contract(Hash([0u8; 32]));
+        let make_entry = |key: ScVal, durability, val| {
+            LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::ContractData(ContractDataEntry {
+                    ext: ExtensionPoint::V0,
+                    contract: contract.clone(),
+                    key,
+                    durability,
+                    val,
+                }),
+                ext: LedgerEntryExt::V0,
+            }
+        };
+        let cases = [
+            (
+                "persistent",
+                ScVal::U32(1),
+                ContractDataDurability::Persistent,
+                ScVal::U32(1),
+            ),
+            (
+                "temporary",
+                ScVal::U32(2),
+                ContractDataDurability::Temporary,
+                ScVal::U32(1),
+            ),
+            (
+                "instance",
+                ScVal::LedgerKeyContractInstance,
+                ContractDataDurability::Persistent,
+                ScVal::ContractInstance(ScContractInstance {
+                    executable: ContractExecutable::StellarAsset,
+                    storage: None,
+                }),
+            ),
+        ];
+        let mut snapshot = SimulationStateSnapshot {
+            ledger_entries: HashMap::new(),
+            ttl_entries: HashMap::new(),
+            latest_ledger: 1,
+        };
+        let mut written_keys = Vec::new();
+
+        for (_, entry_key, durability, val) in cases {
+            let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
+                contract: contract.clone(),
+                key: entry_key.clone(),
+                durability,
+            });
+            let key = BASE64.encode(ledger_key.to_xdr(Limits::none()).unwrap());
+            let entry = make_entry(entry_key, durability, val);
+            let entry_xdr = BASE64.encode(entry.to_xdr(Limits::none()).unwrap());
+            snapshot.ledger_entries.insert(key.clone(), entry_xdr);
+            written_keys.push(key);
+        }
+
+        let analysis = analyze_written_entry_sizes(Some(&snapshot), &written_keys, 10_000);
+        assert_eq!(analysis.unmeasured, 0);
+        assert_eq!(analysis.entries.len(), 3);
+        assert!(analysis
+            .entries
+            .iter()
+            .any(|entry| entry.durability == EntryDurability::Instance));
+        assert!(analysis
+            .entries
+            .iter()
+            .any(|entry| entry.durability == EntryDurability::Temporary));
+    }
+
+    #[test]
+    fn test_entry_size_analysis_counts_undecodable_xdr_as_unmeasured() {
+        use soroban_sdk::xdr::{ContractDataDurability, LedgerKey, LedgerKeyContractData};
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(Hash([0u8; 32])),
+            key: ScVal::U32(1),
+            durability: ContractDataDurability::Persistent,
+        });
+        let key = BASE64.encode(key.to_xdr(Limits::none()).unwrap());
+        let snapshot = SimulationStateSnapshot {
+            ledger_entries: HashMap::from([(key.clone(), "not-valid-xdr".to_string())]),
+            ttl_entries: HashMap::new(),
+            latest_ledger: 1,
+        };
+
+        let analysis = analyze_written_entry_sizes(Some(&snapshot), &[key], 100);
+        assert!(analysis.entries.is_empty());
+        assert_eq!(analysis.unmeasured, 1);
+    }
+
+    #[test]
+    fn test_shrinking_entry_has_no_growth_projection() {
+        assert!(project_entry_growth(120, 110, 200).is_none());
+        assert!(project_entry_growth(110, 110, 200).is_none());
+        assert_eq!(
+            project_entry_growth(100, 110, 200),
+            Some(EntryGrowthProjection {
+                bytes_per_call: 10,
+                estimated_calls_remaining: 9,
+            })
+        );
     }
 
     // ── WasmInstrumenter unit tests ───────────────────────────────────────────
@@ -5879,6 +6883,8 @@ mod tests {
             max_cpu_instructions: 100_000_000,
             max_read_entries: 40,
             max_write_entries: 20,
+            max_transaction_size_bytes: 100_000,
+            max_entry_size_bytes: 64 * 1024,
         };
 
         let report = profile_concentrated_amm_ticks(&raw, Some(limits)).unwrap();

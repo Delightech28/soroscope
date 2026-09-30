@@ -47,8 +47,10 @@ mod tests {
         ("[a-zA-Z0-9]{1,16}", any::<u32>(), -500_000i64..500_000i64).prop_map(|(key, live, rem)| {
             TtlEntryReport {
                 key,
+                key_kind: LedgerKeyKind::Other,
                 live_until_ledger: live,
                 remaining_ledgers: rem,
+                entry_xdr_size_bytes: None,
             }
         })
     }
@@ -84,6 +86,10 @@ mod tests {
             "[a-zA-Z0-9+/=]{0,64}",
         )
             .prop_map(|(res, ledger, cost, td)| SimulationResult {
+                bytes_by_durability: BytesByDurability::from_aggregates_as_other(
+                    res.ledger_read_bytes,
+                    res.ledger_write_bytes,
+                ),
                 resources: res,
                 auth_tree: Default::default(),
                 transaction_hash: None,
@@ -364,8 +370,10 @@ mod tests {
         ) {
             let entries = vec![TtlEntryReport {
                 key,
+                key_kind: LedgerKeyKind::Other,
                 live_until_ledger: live_until,
                 remaining_ledgers: 200_000, // > 120_000 threshold
+                entry_xdr_size_bytes: None,
             }];
             let suggestions =
                 SimulationEngine::build_extend_ttl_suggestions(&entries, 100);

@@ -128,6 +128,10 @@ impl LocalRunner {
         .map_err(|err| err.with_invocation(Some(contract_id), Some(called_function.as_str())))?;
 
         Ok(SimulationResult {
+            bytes_by_durability: crate::simulation::BytesByDurability::from_aggregates_as_other(
+                resources.ledger_read_bytes,
+                resources.ledger_write_bytes,
+            ),
             cost_stroops: estimate_cost_stroops(&resources),
             rent_bytes: None,
             resources,

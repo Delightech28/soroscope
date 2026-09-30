@@ -1,4 +1,4 @@
-use crate::simulation::{AuthTreeReport, SorobanResources};
+use crate::simulation::{BytesByDurability, DurabilityByteCounts, SorobanResources};
 use serde::{Deserialize, Serialize};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -40,6 +40,14 @@ pub trait InsightRule: Send + Sync {
     /// Evaluate the rule against a resource footprint and return zero or more
     /// insights.
     fn evaluate(&self, resources: &SorobanResources) -> Vec<Insight>;
+
+    fn evaluate_with_durability(
+        &self,
+        resources: &SorobanResources,
+        _bytes_by_durability: &BytesByDurability,
+    ) -> Vec<Insight> {
+        self.evaluate(resources)
+    }
 }
 
 // ── Built-in rules ────────────────────────────────────────────────────────────
@@ -54,6 +62,20 @@ impl InsightRule for StorageEfficiencyRule {
     }
 
     fn evaluate(&self, r: &SorobanResources) -> Vec<Insight> {
+        self.evaluate_with_durability(
+            r,
+            &BytesByDurability::from_aggregates_as_other(
+                r.ledger_read_bytes,
+                r.ledger_write_bytes,
+            ),
+        )
+    }
+
+    fn evaluate_with_durability(
+        &self,
+        r: &SorobanResources,
+        bytes_by_durability: &BytesByDurability,
+    ) -> Vec<Insight> {
         let mut out = Vec::new();
 
         // Skip if there's no meaningful data to analyse.
@@ -62,6 +84,12 @@ impl InsightRule for StorageEfficiencyRule {
         }
 
         let write_ratio = r.ledger_write_bytes as f64 / r.transaction_size_bytes as f64;
+        let (dominant_class, dominant_bytes) = dominant_write_class(&bytes_by_durability.write);
+        let advice = if dominant_class == "temporary" {
+            "Review temporary data volume and TTL; batch writes where possible."
+        } else {
+            "Use temporary storage for ephemeral data and batch writes where possible."
+        };
 
         if write_ratio > 2.0 {
             out.push(Insight {
@@ -69,12 +97,10 @@ impl InsightRule for StorageEfficiencyRule {
                 rule: self.name().to_string(),
                 message: format!(
                     "Ledger write bytes ({}) are {:.1}x the transaction size ({}) \
-                     — extremely write-heavy",
-                    r.ledger_write_bytes, write_ratio, r.transaction_size_bytes
+                     — extremely write-heavy; dominant class: {} ({} bytes)",
+                    r.ledger_write_bytes, write_ratio, r.transaction_size_bytes, dominant_class, dominant_bytes
                 ),
-                suggested_fix: "Use temporary storage (TTL entries) for ephemeral data \
-                                and batch writes where possible."
-                    .to_string(),
+                suggested_fix: advice.to_string(),
             });
         } else if write_ratio > 1.0 {
             out.push(Insight {
@@ -82,17 +108,32 @@ impl InsightRule for StorageEfficiencyRule {
                 rule: self.name().to_string(),
                 message: format!(
                     "Ledger write bytes ({}) exceed transaction size ({}) \
-                     — consider reviewing storage layout",
-                    r.ledger_write_bytes, r.transaction_size_bytes
+                     — dominant class: {} ({} bytes); consider reviewing storage layout",
+                    r.ledger_write_bytes, r.transaction_size_bytes, dominant_class, dominant_bytes
                 ),
-                suggested_fix:
-                    "Consolidate writes into fewer ledger keys or use compact serialization."
-                        .to_string(),
+                suggested_fix: if dominant_class == "temporary" {
+                    "Review temporary data volume and TTL; consolidate writes or use compact serialization.".to_string()
+                } else {
+                    "Consolidate writes into fewer ledger keys or use compact serialization.".to_string()
+                },
             });
         }
 
         out
     }
+}
+
+fn dominant_write_class(bytes: &DurabilityByteCounts) -> (&'static str, u64) {
+    [
+        ("code", bytes.code),
+        ("instance", bytes.instance),
+        ("persistent", bytes.persistent),
+        ("temporary", bytes.temporary),
+        ("other", bytes.other),
+    ]
+    .into_iter()
+    .max_by_key(|(_, count)| *count)
+    .unwrap_or(("other", 0))
 }
 
 /// Detects high CPU usage with relatively low ledger activity, indicating
@@ -356,27 +397,36 @@ impl InsightsEngine {
         }
     }
 
-    pub fn analyze_with_auth_tree(
+    /// Run the standard rules plus insights derived from measured ledger entries.
+    pub fn analyze_with_additional_insights(
         &self,
         resources: &SorobanResources,
-        auth_tree: &AuthTreeReport,
+        additional_insights: Vec<Insight>,
     ) -> InsightsReport {
-        let mut report = self.analyze(resources);
-        if auth_tree.exceeds_transaction_size_limit {
-            report.insights.push(Insight {
-                severity: Severity::Warning,
-                rule: "auth_tree_size".to_string(),
-                message: format!(
-                    "Authorization bytes ({}) exceed the transaction size limit ({} bytes).",
-                    auth_tree.total_xdr_bytes, auth_tree.transaction_size_limit_bytes
-                ),
-                suggested_fix:
-                    "Reduce the number or depth of authorization entries and sub-invocations."
-                        .to_string(),
-            });
-            report.efficiency_score = Self::compute_efficiency_score(resources, &report.insights);
+        let bytes = BytesByDurability::from_aggregates_as_other(
+            resources.ledger_read_bytes,
+            resources.ledger_write_bytes,
+        );
+        self.analyze_with_durability_and_additional_insights(resources, &bytes, additional_insights)
+    }
+
+    pub fn analyze_with_durability_and_additional_insights(
+        &self,
+        resources: &SorobanResources,
+        bytes_by_durability: &BytesByDurability,
+        additional_insights: Vec<Insight>,
+    ) -> InsightsReport {
+        let mut insights: Vec<Insight> = self
+            .rules
+            .iter()
+            .flat_map(|rule| rule.evaluate_with_durability(resources, bytes_by_durability))
+            .collect();
+        insights.extend(additional_insights);
+        let efficiency_score = Self::compute_efficiency_score(resources, &insights);
+        InsightsReport {
+            efficiency_score,
+            insights,
         }
-        report
     }
 
     /// Weighted efficiency score (0–100).
@@ -544,6 +594,28 @@ mod tests {
         let insights = rule.evaluate(&r);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn temporary_only_writes_do_not_recommend_temporary_storage() {
+        let rule = StorageEfficiencyRule;
+        let resources = SorobanResources {
+            ledger_write_bytes: 5_000,
+            transaction_size_bytes: 1_024,
+            ..Default::default()
+        };
+        let breakdown = BytesByDurability {
+            write: DurabilityByteCounts {
+                temporary: 5_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let insights = rule.evaluate_with_durability(&resources, &breakdown);
+        assert_eq!(insights.len(), 1);
+        assert!(insights[0].message.contains("temporary (5000 bytes)"));
+        assert!(!insights[0].suggested_fix.contains("Use temporary storage"));
     }
 
     #[test]
