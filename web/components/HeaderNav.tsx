@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import Link from "next/link";
+import { useRouter } from "next/router";
 import {
   Menu,
   X,
@@ -12,6 +13,8 @@ import {
   Network,
   Search,
   Settings,
+  Calculator,
+  BarChart3,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { ConnectButton } from "./ConnectButton";
@@ -25,6 +28,23 @@ const NAV_TABS: { id: NavTab; label: string; Icon: typeof Layers }[] = [
   { id: "history", label: "History", Icon: History },
   { id: "transactions", label: "Transactions", Icon: List },
 ];
+
+type QuickNavItem =
+  | { id: string; label: string; Icon: typeof Activity; kind: "tab"; tab: NavTab; href: string }
+  | { id: string; label: string; Icon: typeof Activity; kind: "route"; href: string };
+
+export const HEADER_QUICK_LINKS: QuickNavItem[] = [
+  { id: "simulator", label: "Simulator", Icon: Activity, kind: "tab", tab: "explorer", href: "/?tab=explorer#simulator" },
+  { id: "analytics", label: "Analytics", Icon: BarChart3, kind: "tab", tab: "schema", href: "/?tab=schema#analytics" },
+  { id: "staking", label: "Staking Calculator", Icon: Calculator, kind: "tab", tab: "explorer", href: "/?tab=explorer#staking-calculator" },
+  { id: "settings", label: "Settings", Icon: Settings, kind: "route", href: "/settings" },
+];
+
+export function isHeaderQuickLinkActive(item: QuickNavItem, activeTab: NavTab, pathname: string): boolean {
+  if (item.kind === "route") return pathname === item.href;
+  return activeTab === item.tab;
+}
+
 interface HeaderNavProps {
   tab: NavTab;
   setTab: (tab: NavTab) => void;
@@ -39,6 +59,7 @@ function openGlobalSearch() {
 
 export function HeaderNav({ tab, setTab }: HeaderNavProps) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const router = useRouter();
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
 
@@ -72,6 +93,10 @@ export function HeaderNav({ tab, setTab }: HeaderNavProps) {
   const handleSelectTab = (selectedTab: NavTab) => {
     setTab(selectedTab);
     setMobileMenuOpen(false);
+  };
+
+  const handleQuickTabSelect = (selectedTab: NavTab) => {
+    handleSelectTab(selectedTab);
   };
 
   return (
@@ -203,6 +228,50 @@ export function HeaderNav({ tab, setTab }: HeaderNavProps) {
 
               {/* Drawer Links */}
               <nav className="mt-6 flex flex-col gap-2">
+                <p className="px-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                  Quick navigation
+                </p>
+                {HEADER_QUICK_LINKS.map((item) => {
+                  const Icon = item.Icon;
+                  const isActive = isHeaderQuickLinkActive(item, tab, router.pathname);
+                  const className = `flex min-h-[48px] w-full items-center gap-3 rounded-xl px-4 py-3.5 text-base font-medium transition-colors ${
+                    isActive
+                      ? "bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 font-semibold"
+                      : "text-slate-300 hover:bg-slate-800/80 hover:text-white"
+                  }`;
+
+                  if (item.kind === "route") {
+                    return (
+                      <Link
+                        key={item.id}
+                        href={item.href}
+                        onClick={() => setMobileMenuOpen(false)}
+                        aria-current={isActive ? "page" : undefined}
+                        className={className}
+                      >
+                        <Icon className="h-5 w-5" />
+                        <span>{item.label}</span>
+                      </Link>
+                    );
+                  }
+
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => handleQuickTabSelect(item.tab)}
+                      aria-current={isActive ? "page" : undefined}
+                      className={className}
+                    >
+                      <Icon className="h-5 w-5" />
+                      <span>{item.label}</span>
+                    </button>
+                  );
+                })}
+
+                <p className="px-1 pt-4 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                  Analyzer panels
+                </p>
                 {NAV_TABS.map(({ id, label, Icon }) => (
                   <button
                     key={id}
@@ -232,14 +301,6 @@ export function HeaderNav({ tab, setTab }: HeaderNavProps) {
                   <span>Search</span>
                 </button>
 
-                <Link
-                  href="/settings"
-                  onClick={() => setMobileMenuOpen(false)}
-                  className="flex min-h-[48px] w-full items-center gap-3 rounded-xl px-4 py-3.5 text-base font-medium text-slate-300 transition-colors hover:bg-slate-800/80 hover:text-white"
-                >
-                  <Settings className="h-5 w-5" />
-                  <span>Settings</span>
-                </Link>
               </nav>
             </div>
 

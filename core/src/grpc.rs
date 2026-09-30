@@ -49,6 +49,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::ws::{SimulationBus, SimulationEvent};
 
@@ -65,8 +66,8 @@ use proto::event_stream_service_server::EventStreamService;
 pub use proto::event_stream_service_server::EventStreamServiceServer;
 use proto::{ContractEvent, StreamContractEventsRequest};
 
-pub use telemetry_proto::telemetry_stream_service_server::TelemetryStreamServiceServer;
 use telemetry_proto::telemetry_stream_service_server::TelemetryStreamService;
+pub use telemetry_proto::telemetry_stream_service_server::TelemetryStreamServiceServer;
 use telemetry_proto::{StreamTelemetryRequest, TelemetryMetric};
 
 // ── Service implementation ────────────────────────────────────────────────────
@@ -100,6 +101,9 @@ impl EventStreamService for EventStreamServiceImpl {
         &self,
         request: Request<StreamContractEventsRequest>,
     ) -> Result<Response<Self::StreamContractEventsStream>, Status> {
+        let server_span = tracing::info_span!("grpc.stream_contract_events");
+        server_span.set_parent(crate::trace_propagation::extract_grpc(request.metadata()));
+        let _span_guard = server_span.enter();
         let params = request.into_inner();
         let contract_id_filter = params.contract_id.clone();
         let event_types_filter: Vec<String> = params
@@ -151,7 +155,8 @@ impl TelemetryStreamServiceImpl {
     }
 }
 
-type TelemetryStream = Pin<Box<dyn Stream<Item = Result<TelemetryMetric, Status>> + Send + 'static>>;
+type TelemetryStream =
+    Pin<Box<dyn Stream<Item = Result<TelemetryMetric, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl TelemetryStreamService for TelemetryStreamServiceImpl {
@@ -161,6 +166,9 @@ impl TelemetryStreamService for TelemetryStreamServiceImpl {
         &self,
         request: Request<StreamTelemetryRequest>,
     ) -> Result<Response<Self::StreamTelemetryStream>, Status> {
+        let server_span = tracing::info_span!("grpc.stream_telemetry");
+        server_span.set_parent(crate::trace_propagation::extract_grpc(request.metadata()));
+        let _span_guard = server_span.enter();
         let params = request.into_inner();
         let target_contract_id = params.contract_id;
 
@@ -171,7 +179,10 @@ impl TelemetryStreamService for TelemetryStreamServiceImpl {
             .filter_map(move |item| match item {
                 Err(_) => None,
                 Ok(traced_msg) => match traced_msg.payload {
-                    SimulationEvent::Completed { contract_id, result } => {
+                    SimulationEvent::Completed {
+                        contract_id,
+                        result,
+                    } => {
                         if target_contract_id.is_empty() || contract_id == target_contract_id {
                             Some(TelemetryMetric {
                                 contract_id,

@@ -1,6 +1,10 @@
 import React, { useState, useMemo } from 'react';
-import { calculateStakingYield } from '../lib/stakingCalculator';
-import { Calculator, TrendingUp, Calendar, Zap, DollarSign, RefreshCw, BarChart2 } from 'lucide-react';
+import {
+  calculateStakingYield,
+  sanitizeNumericInput,
+  STAKING_INPUT_LIMITS,
+} from '../lib/stakingCalculator';
+import { Calculator, TrendingUp, Calendar, Zap, DollarSign, BarChart2 } from 'lucide-react';
 
 export interface StakingCalculatorProps {
   initialDeposit?: number;
@@ -31,6 +35,28 @@ export function StakingCalculator({
       enableTierMultiplier,
     });
   }, [depositAmount, lockDurationMonths, compoundFrequency, baseApyPercentage, enableTierMultiplier]);
+
+  const projectionChart = useMemo(() => {
+    const points = results.breakdownByMonth;
+    if (points.length === 0) return '';
+
+    const width = 320;
+    const height = 120;
+    const padding = 12;
+    const maxBalance = Math.max(...points.map((point) => point.balance), results.depositAmount + 1);
+    const minBalance = Math.min(results.depositAmount, ...points.map((point) => point.balance));
+    const balanceRange = Math.max(1, maxBalance - minBalance);
+
+    return points
+      .map((point, index) => {
+        const x = points.length === 1
+          ? width / 2
+          : padding + (index / (points.length - 1)) * (width - padding * 2);
+        const y = height - padding - ((point.balance - minBalance) / balanceRange) * (height - padding * 2);
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+      })
+      .join(' ');
+  }, [results]);
 
   const presetAmounts = [500, 1000, 5000, 10000, 50000];
   const presetDurations = [
@@ -75,10 +101,16 @@ export function StakingCalculator({
                 <input
                   id="deposit-amount-input"
                   type="number"
-                  min="0"
-                  max="1000000"
+                  min={STAKING_INPUT_LIMITS.depositAmount.min}
+                  max={STAKING_INPUT_LIMITS.depositAmount.max}
+                  step="any"
+                  inputMode="decimal"
                   value={depositAmount}
-                  onChange={(e) => setDepositAmount(Math.max(0, Number(e.target.value)))}
+                  onChange={(e) =>
+                    setDepositAmount(
+                      sanitizeNumericInput(e.target.value, STAKING_INPUT_LIMITS.depositAmount)
+                    )
+                  }
                   className="w-28 rounded border border-slate-700 bg-slate-950 px-2 py-0.5 text-right font-mono text-slate-100 focus:border-cyan-400 focus:outline-none"
                 />
               </div>
@@ -162,11 +194,16 @@ export function StakingCalculator({
                 <input
                   id="base-apy-input"
                   type="number"
-                  min="0"
-                  max="100"
+                  min={STAKING_INPUT_LIMITS.baseApyPercentage.min}
+                  max={STAKING_INPUT_LIMITS.baseApyPercentage.max}
                   step="0.1"
+                  inputMode="decimal"
                   value={baseApyPercentage}
-                  onChange={(e) => setBaseApyPercentage(Math.max(0, Number(e.target.value)))}
+                  onChange={(e) =>
+                    setBaseApyPercentage(
+                      sanitizeNumericInput(e.target.value, STAKING_INPUT_LIMITS.baseApyPercentage)
+                    )
+                  }
                   className="w-20 rounded border border-slate-700 bg-slate-950 px-2 py-0.5 text-right font-mono text-slate-100 focus:border-cyan-400 focus:outline-none"
                 />
                 <span>%</span>
@@ -291,6 +328,45 @@ export function StakingCalculator({
                 </div>
                 <span className="text-[10px] text-slate-500">~{results.estimatedDailyYield} / day</span>
               </div>
+            </div>
+          </div>
+
+          {/* Reward Projection Chart */}
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+            <div className="mb-3 flex items-center justify-between text-xs font-medium text-slate-400">
+              <span>Reward Projection Chart</span>
+              <span className="font-mono text-cyan-400">{results.lockDurationMonths}M</span>
+            </div>
+            <svg
+              role="img"
+              aria-label="Projected staking balance over the selected lock duration"
+              viewBox="0 0 320 120"
+              className="h-32 w-full overflow-visible"
+              preserveAspectRatio="none"
+            >
+              <defs>
+                <linearGradient id="stakingProjectionGradient" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#22d3ee" stopOpacity="0.35" />
+                  <stop offset="100%" stopColor="#22d3ee" stopOpacity="0" />
+                </linearGradient>
+              </defs>
+              <polyline
+                points={`12,108 ${projectionChart} 308,108`}
+                fill="url(#stakingProjectionGradient)"
+                stroke="none"
+              />
+              <polyline
+                points={projectionChart}
+                fill="none"
+                stroke="#22d3ee"
+                strokeWidth="3"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            <div className="mt-2 flex justify-between text-[11px] text-slate-500">
+              <span>Month 1</span>
+              <span>{results.lockDurationMonths} months</span>
             </div>
           </div>
 
