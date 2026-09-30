@@ -25,7 +25,7 @@ where
             parser,
         }
     }
-    
+
     pub async fn simulate_transaction(
         &self,
         transaction_xdr: &str,
@@ -38,32 +38,32 @@ where
                 return Ok(result);
             }
         }
-        
+
         // Call provider
         let rpc_result = self.provider
             .simulate_transaction(transaction_xdr)
             .await
             .map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
-        
+
         // Parse result
         let result = self.parse_simulation_result(rpc_result)?;
-        
+
         // Cache result
         if let Ok(cached) = serde_json::to_vec(&result) {
             let _ = self.cache.set(&cache_key, cached).await;
         }
-        
+
         Ok(result)
     }
-    
+
     fn parse_simulation_result(
         &self,
         rpc_result: SimulationRpcResult,
     ) -> Result<SimulationResult, SimulationError> {
         let resources = if let (Some(cpu), Some(mem)) = (rpc_result.cpu_insns, rpc_result.mem_bytes) {
-            let (ledger_read_bytes, ledger_write_bytes) = 
+            let (ledger_read_bytes, ledger_write_bytes) =
                 self.extract_footprint_from_xdr(&rpc_result.transaction_data);
-            
+
             SorobanResources {
                 cpu_instructions: cpu,
                 ram_bytes: mem,
@@ -74,11 +74,12 @@ where
         } else {
             SorobanResources::default()
         };
-        
+
         let cost_stroops = self.calculate_cost(&resources);
-        
+
         Ok(SimulationResult {
             resources,
+            auth_tree: Default::default(),
             transaction_hash: None,
             latest_ledger: rpc_result.latest_ledger,
             cost_stroops,
@@ -91,83 +92,33 @@ where
             protocol_version: 0,
         })
     }
-    
+
     fn extract_footprint_from_xdr(&self, transaction_data: &str) -> (u64, u64) {
         if transaction_data.is_empty() {
             return (0, 0);
         }
-        
+
         let xdr_bytes = match BASE64.decode(transaction_data) {
             Ok(bytes) => bytes,
             Err(_) => return (0, 0),
         };
-        
+
         let soroban_data = match SorobanTransactionData::from_xdr(&xdr_bytes, Limits::none()) {
             Ok(data) => data,
             Err(_) => return (0, 0),
         };
-        
+
         let footprint = &soroban_data.resources.footprint;
         let read_bytes = footprint.read_only.len() as u64 * 64;
         let write_bytes = footprint.read_write.len() as u64 * 64;
-        
+
         (read_bytes, write_bytes)
     }
-    
+
     fn calculate_cost(&self, resources: &SorobanResources) -> u64 {
         let cpu_cost = resources.cpu_instructions / 10000;
         let ram_cost = resources.ram_bytes / 1024;
         let ledger_cost = (resources.ledger_read_bytes + resources.ledger_write_bytes) / 1024;
         cpu_cost + ram_cost + ledger_cost
-    }
-}
-
-/// Handler for executing simulations on isolated state snapshots with automatic rollback.
-#[derive(Debug, Clone)]
-pub struct IsolatedSimulationSession<S> {
-    snapshot: S,
-}
-
-impl<S: Clone> IsolatedSimulationSession<S> {
-    pub fn new(snapshot: S) -> Self {
-        Self { snapshot }
-    }
-
-    /// Execute simulation closure on a copy of the state snapshot, automatically rolling back (discarding) changes.
-    pub fn execute_with_rollback<F, R>(&self, mut sim_fn: F) -> R
-    where
-        F: FnMut(&mut S) -> R,
-    {
-        let mut isolated_state = self.snapshot.clone();
-        sim_fn(&mut isolated_state)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    #[test]
-    fn test_isolated_simulation_state_rollback() {
-        let mut initial_state = HashMap::new();
-        initial_state.insert("key1".to_string(), "val1".to_string());
-
-        let session = IsolatedSimulationSession::new(initial_state.clone());
-
-        let res1 = session.execute_with_rollback(|state| {
-            state.insert("key1".to_string(), "mutated1".to_string());
-            state.insert("key2".to_string(), "val2".to_string());
-            state.len()
-        });
-        assert_eq!(res1, 2);
-
-        assert_eq!(session.snapshot.get("key1").unwrap(), "val1");
-        assert!(!session.snapshot.contains_key("key2"));
-
-        let res2 = session.execute_with_rollback(|state| {
-            state.get("key1").cloned()
-        });
-        assert_eq!(res2, Some("val1".to_string()));
     }
 }
